@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# NFL prediction pipeline configuration
+# ---------------------------------------------------------------------------
+data:
+  # Seasons used for training. nflverse play-by-play with EPA/CPOE and
+  # betting lines is reliable from 2012 onward; tracking-derived line
+  # metrics (pressure, time-to-throw, box counts) exist from 2016.
+  first_season: 2012
+  # The season currently being played (predictions are generated for it).
+  current_season: 2026
+  # Re-download current-season files if the cached copy is older than this.
+  refresh_hours: 6
+  # "nflverse_direct" reads the nflfastR parquet releases straight from
+  # GitHub with column push-down (fast, schema-stable). "nfl_data_py" routes
+  # play-by-play through the nfl_data_py package instead; either way the
+  # bytes come from the same nflverse/nflfastR release artifacts.
+  pbp_source: nflverse_direct
+  include_postseason: true
+
+features:
+  rolling_windows: [3, 6]          # simple trailing means (prior games only)
+  ewma_halflife: 4.0               # games; season-long EWMA
+  ewma_prior_shrink: 0.6           # weight on last season's final EWMA at week 1
+  rolling_cross_season: true       # let 3/6-game windows span the offseason
+  neutral_wp_band: [0.10, 0.90]    # win-probability band for "neutral script" metrics
+  garbage_time_qtr4_margin: 16     # 4th-quarter |margin| beyond which plays are garbage time
+  player_positions: [QB, RB, WR, TE]
+  player_min_prior_games: 1        # minimum prior games before a player row is modelable
+  dome_temp_f: 70.0
+  dome_wind_mph: 0.0
+
+feature_selection:
+  max_missing_frac: 0.70           # drop features missing more than this share of rows
+  min_variance: 1.0e-8
+  corr_threshold: 0.92             # collinearity clustering threshold (|Spearman|)
+  null_importance_shuffles: 8      # permuted-target refits for the noise filter
+  null_importance_quantile: 0.90   # real gain must beat this quantile of null gains
+  min_keep: 25                     # always keep at least the top-k features by gain
+  max_keep: 160
+
+validation:
+  min_train_seasons: 5             # first validation fold trains on this many seasons
+  fold_unit: season                # rolling-origin block size: "season" or "week"
+  early_stop_tail_frac: 0.12       # chronological tail of TRAIN used for early stopping
+
+models:
+  game:
+    targets: [margin, total, win]
+    use_market_features: true      # include closing spread/total/moneyline as features
+    ensemble_members: [lgbm, xgb, cat]
+    n_estimators: 1500
+    learning_rate: 0.02
+    seed: 42
+  player:
+    targets: [passing_yards, passing_tds, rushing_yards, rushing_tds, receiving_yards, receiving_tds]
+    model_type: blend              # "nn" | "gbm" | "blend"
+    nn:
+      hidden: [256, 128, 64]
+      dropout: 0.15
+      lr: 0.001
+      weight_decay: 0.0001
+      batch_size: 512
+      max_epochs: 200
+      patience: 15
+      seed: 42
+    gbm:
+      n_estimators: 1200
+      learning_rate: 0.02
+      num_leaves: 31
+
+betting:
+  default_vig_odds: -110
+  kelly_fraction: 0.25             # fractional Kelly
+  max_stake_frac: 0.03             # cap on bankroll fraction per bet
+  min_edge_pct: 2.0                # only surface plays with >= this % edge over the market

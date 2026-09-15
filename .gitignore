@@ -1,0 +1,21 @@
+# data & artifacts (regenerate with the pipeline)
+data/raw/
+data/processed/
+data/features/*.parquet
+data/models/
+predictions/*.csv
+optuna_studies/*.db
+optuna_studies/*.log
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.log
+.ipynb_checkpoints/
+
+# approval marker is a local decision, never committed
+data/features/APPROVED
