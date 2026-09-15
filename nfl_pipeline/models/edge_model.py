@@ -71,18 +71,27 @@ FEATURES = {"spread": SPREAD_FEATURES, "total": TOTAL_FEATURES}
 ID_COLS = ["game_id", "season", "week", "gameday", "home_team", "away_team", "played"]
 
 
-def build_edge_frame(gf: pd.DataFrame, pf_margin: np.ndarray, pf_total: np.ndarray, ref: str = "open") -> pd.DataFrame:
+def build_edge_frame(gf: pd.DataFrame, pf_margin: np.ndarray, pf_total: np.ndarray, ref: str = "open",
+                     spread_col: str | None = None, total_col: str | None = None) -> pd.DataFrame:
     """Derived stage-2 columns for the rows of ``gf`` (any subset, any order).
 
     ``pf_margin`` / ``pf_total`` are stage-1 predictions aligned with ``gf``:
     out-of-fold during training, final-model predictions when forecasting.
+    ``ref="open"`` anchors to the opening line (closing line where no open is
+    known); ``ref="close"`` to the closing line; passing ``spread_col`` /
+    ``total_col`` anchors to arbitrary line columns (e.g. the current line at
+    bet time), flagged as an opening line only where it still equals the open.
     """
     e = gf.copy()
     e["pf_margin"] = np.asarray(pf_margin, dtype=float)
     e["pf_total"] = np.asarray(pf_total, dtype=float)
     sp_open = e["spread_open"] if "spread_open" in e else pd.Series(np.nan, index=e.index)
     to_open = e["total_open"] if "total_open" in e else pd.Series(np.nan, index=e.index)
-    if ref == "open":
+    if spread_col is not None:
+        e["spread_ref"] = e[spread_col].astype(float)
+        e["total_ref"] = e[total_col].astype(float)
+        e["ref_is_open"] = (e["spread_ref"] == sp_open).astype(float)
+    elif ref == "open":
         e["spread_ref"] = sp_open.fillna(e["spread_line"])
         e["total_ref"] = to_open.fillna(e["total_line"])
         e["ref_is_open"] = sp_open.notna().astype(float)

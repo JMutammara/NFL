@@ -132,20 +132,34 @@ def predict_games(g: pd.DataFrame, models: dict, sched: pd.DataFrame, cfg, bankr
         pf_m = models["pf_margin"].predict(g)
         pf_t = models["pf_total"].predict(g)
         out["pf_margin"], out["pf_total"] = pf_m, pf_t
-        e = build_edge_frame(g, pf_m, pf_t, ref="open")
         es, et = models["edge_spread"], models["edge_total"]
-        ps = es.predict(e[es.features_], e["spread_ref"].to_numpy(), line_sp.to_numpy())
-        pt = et.predict(e[et.features_], e["total_ref"].to_numpy(), line_to.to_numpy())
+        # The residual model is evaluated relative to the line being bet: the current line for live
+        # bets (line moves carry information, so the open is not a valid anchor once it has moved)
+        # and the opening line for the "at the open" view. Each anchor gets its own feature frame.
+        frames = {"open": build_edge_frame(g, pf_m, pf_t, ref="open"),
+                  "current": build_edge_frame(g, pf_m, pf_t, spread_col="spread_now", total_col="total_now")}
+        res = {}
+        for key, e in frames.items():
+            res[key] = (es.predict(e[es.features_], e["spread_ref"].to_numpy()), et.predict(e[et.features_], e["total_ref"].to_numpy()))
+        ps, pt = res[bet_line]
+        ps_open, pt_open = res["open"]
+        ps_now, pt_now = res["current"]
         out["model_margin"] = ps["mu"].to_numpy()
+        out["model_margin_open"] = ps_open["mu"].to_numpy()
+        out["model_margin_now"] = ps_now["mu"].to_numpy()
         out["spread_edge_pts"] = ps["edge_pts"].to_numpy()
         out["p_home_cover"] = ps["p_cover"].to_numpy()
-        out["p_home_cover_open"] = es.cover_prob(ps["mu"].to_numpy() - out["spread_open"].to_numpy(), ps["p_cls"].to_numpy())
+        out["p_home_cover_open"] = ps_open["p_cover"].to_numpy()
+        out["p_home_cover_now"] = ps_now["p_cover"].to_numpy()
         out["p_home_cover_normal"] = ps["p_cover_normal"].to_numpy()
         out["margin_sigma"] = es.sigma_
         out["model_total"] = pt["mu"].to_numpy()
+        out["model_total_open"] = pt_open["mu"].to_numpy()
+        out["model_total_now"] = pt_now["mu"].to_numpy()
         out["total_edge_pts"] = pt["edge_pts"].to_numpy()
         out["p_over"] = pt["p_cover"].to_numpy()
-        out["p_over_open"] = et.cover_prob(pt["mu"].to_numpy() - out["total_open"].to_numpy(), pt["p_cls"].to_numpy())
+        out["p_over_open"] = pt_open["p_cover"].to_numpy()
+        out["p_over_now"] = pt_now["p_cover"].to_numpy()
         out["total_sigma"] = et.sigma_
         out["p_home_win"] = ps["p_home_win"].to_numpy()
     else:  # legacy market-aware ensemble with Normal tails
