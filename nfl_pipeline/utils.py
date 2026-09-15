@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 import time
 from contextlib import contextmanager
@@ -12,6 +13,10 @@ import numpy as np
 import pandas as pd
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
+
+# Threads per model fit. Override with NFL_N_JOBS; boosters on a few thousand
+# rows stop scaling past ~8 threads, so cap there by default.
+N_JOBS = int(os.environ.get("NFL_N_JOBS", min(8, os.cpu_count() or 4)))
 
 
 def get_logger(name: str = "nfl") -> logging.Logger:
@@ -31,9 +36,9 @@ log = get_logger()
 @contextmanager
 def timed(label: str) -> Iterator[None]:
     t0 = time.time()
-    log.info("▶ %s", label)
+    log.info(">> %s", label)
     yield
-    log.info("✔ %s (%.1fs)", label, time.time() - t0)
+    log.info("OK %s (%.1fs)", label, time.time() - t0)
 
 
 # ---------------------------------------------------------------------------

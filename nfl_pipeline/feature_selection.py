@@ -10,7 +10,7 @@ import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from .utils import log
+from .utils import N_JOBS, log
 
 try:
     import lightgbm as lgb
@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover
 def _quick_gain(X: pd.DataFrame, y: np.ndarray, task: str, seed: int, n_estimators: int = 300) -> pd.Series:
     params = dict(n_estimators=n_estimators, learning_rate=0.05, num_leaves=15, min_child_samples=30,
                   colsample_bytree=0.5, subsample=0.8, subsample_freq=1, reg_lambda=5.0, random_state=seed,
-                  verbose=-1, n_jobs=4, importance_type="gain")
+                  verbose=-1, n_jobs=N_JOBS, importance_type="gain")
     model = lgb.LGBMClassifier(**params) if task == "classification" else lgb.LGBMRegressor(**params)
     model.fit(X, y)
     return pd.Series(model.feature_importances_, index=X.columns, dtype=float)

@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import BEST_PARAMS_DIR
-from ..utils import log
+from ..utils import N_JOBS, log
 
 try:
     import torch
@@ -129,7 +129,7 @@ class PlayerVolatilityNet:
     def fit(self, X: np.ndarray, y: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> "PlayerVolatilityNet":
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
-        torch.set_num_threads(4)
+        torch.set_num_threads(N_JOBS)
         self.y_scale_ = 1.0 if self.kind == "poisson" else float(np.std(y) + 1e-6)
         Xt = torch.tensor(X, dtype=torch.float32)
         yt = torch.tensor(y / self.y_scale_, dtype=torch.float32)
@@ -216,7 +216,7 @@ class HeteroscedasticGBM:
     def _params(self, objective: str, n_est: int) -> dict:
         return dict(n_estimators=n_est, learning_rate=self.learning_rate, num_leaves=self.num_leaves, min_child_samples=50,
                     colsample_bytree=0.6, subsample=0.8, subsample_freq=1, reg_lambda=5.0, objective=objective,
-                    random_state=self.seed, verbose=-1, n_jobs=4)
+                    random_state=self.seed, verbose=-1, n_jobs=N_JOBS)
 
     def fit(self, X: pd.DataFrame, y: np.ndarray, X_val: pd.DataFrame, y_val: np.ndarray) -> "HeteroscedasticGBM":
         import lightgbm as lgb

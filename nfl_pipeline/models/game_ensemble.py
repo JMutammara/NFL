@@ -24,7 +24,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from ..config import BEST_PARAMS_DIR
-from ..utils import log
+from ..utils import N_JOBS, log
 
 TASK_KIND = {"margin": "regression", "total": "regression", "win": "classification"}
 
@@ -32,20 +32,20 @@ TASK_KIND = {"margin": "regression", "total": "regression", "win": "classificati
 def default_params(member: str, kind: str, n_estimators: int, lr: float, seed: int) -> dict[str, Any]:
     if member == "lgbm":
         p = dict(n_estimators=n_estimators, learning_rate=lr, num_leaves=15, min_child_samples=40, colsample_bytree=0.5,
-                 subsample=0.8, subsample_freq=1, reg_lambda=5.0, reg_alpha=0.0, random_state=seed, verbose=-1, n_jobs=4)
+                 subsample=0.8, subsample_freq=1, reg_lambda=5.0, reg_alpha=0.0, random_state=seed, verbose=-1, n_jobs=N_JOBS)
         if kind == "classification":
             p["objective"] = "binary"
         return p
     if member == "xgb":
         p = dict(n_estimators=n_estimators, learning_rate=lr, max_depth=4, min_child_weight=10, colsample_bytree=0.5,
-                 subsample=0.8, reg_lambda=5.0, gamma=0.0, random_state=seed, n_jobs=4, tree_method="hist")
+                 subsample=0.8, reg_lambda=5.0, gamma=0.0, random_state=seed, n_jobs=N_JOBS, tree_method="hist")
         p["objective"] = "binary:logistic" if kind == "classification" else "reg:squarederror"
         if kind == "classification":
             p["eval_metric"] = "logloss"
         return p
     if member == "cat":
         p = dict(iterations=n_estimators, learning_rate=lr * 1.5, depth=5, l2_leaf_reg=6.0, rsm=0.5, random_seed=seed,
-                 verbose=0, thread_count=4, allow_writing_files=False)
+                 verbose=0, thread_count=N_JOBS, allow_writing_files=False)
         p["loss_function"] = "Logloss" if kind == "classification" else "RMSE"
         return p
     if member == "ridge":

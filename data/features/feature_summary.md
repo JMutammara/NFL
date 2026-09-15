@@ -1,6 +1,6 @@
 ```
 ==============================================================================
-FEATURE ENGINEERING SUMMARY  (generated 2026-09-15 06:31)
+FEATURE ENGINEERING SUMMARY  (generated 2026-09-15 10:05)
 ==============================================================================
 
 [GAME-LEVEL MATRIX]  data/features/game_features.parquet
@@ -24,8 +24,8 @@ FEATURE ENGINEERING SUMMARY  (generated 2026-09-15 06:31)
   next slate      : season 2026 week 2 -> 16 games
 
 [PLAYER-LEVEL MATRIX]  data/features/player_features.parquet
-  rows            : 89,043 player-games  (81,747 played, 7,296 projection rows)
-  players         : 2,276   by position: WR 34,057, RB 21,688, TE 16,933, QB 9,069
+  rows            : 89,747 player-games  (81,747 played, 8,000 projection rows)
+  players         : 2,302   by position: WR 34,057, RB 21,688, TE 16,933, QB 9,069
   features        : 312
   targets         : passing_yards, passing_tds, rushing_yards, rushing_tds, receiving_yards, receiving_tds  (aux: targets, carries, attempts, receptions)
     passing_yards    mean  23.10  sd  74.11  zero-share 89.3%
