@@ -272,7 +272,8 @@ def build_team_game_stats(
 
     # schedule skeleton: two rows per game
     sch = schedules[["game_id", "season", "week", "game_type", "gameday", "home_team", "away_team",
-                     "home_score", "away_score", "home_qb_id", "away_qb_id", "home_qb_name", "away_qb_name"]].copy()
+                     "home_score", "away_score", "home_qb_id", "away_qb_id", "home_qb_name", "away_qb_name",
+                     "spread_line", "total_line"]].copy()
     home = sch.rename(columns={"home_team": "team", "away_team": "opponent", "home_score": "points_for",
                                "away_score": "points_against", "home_qb_id": "sched_qb_id", "home_qb_name": "sched_qb_name"})
     home = home.drop(columns=["away_qb_id", "away_qb_name"])
@@ -283,6 +284,11 @@ def build_team_game_stats(
     away["is_home"] = 0
     tg = pd.concat([home, away], ignore_index=True)
     tg["margin"] = tg["points_for"] - tg["points_against"]
+    # against-the-spread outcomes from the team's perspective (rolled later => prior-only ATS form)
+    team_spread = np.where(tg["is_home"] == 1, tg["spread_line"], -tg["spread_line"])  # points the team was favoured by
+    tg["ats_cover_margin"] = tg["margin"] - team_spread
+    tg["ats_over_margin"] = (tg["points_for"] + tg["points_against"]) - tg["total_line"]
+    tg = tg.drop(columns=["spread_line", "total_line"])
     tg["win"] = np.where(tg["margin"].isna(), np.nan, (tg["margin"] > 0).astype(float) + 0.5 * (tg["margin"] == 0))
     tg["played"] = tg["points_for"].notna().astype(int)
     tg["season_type"] = np.where(tg["game_type"] == "REG", "REG", "POST")

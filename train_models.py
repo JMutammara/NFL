@@ -41,6 +41,7 @@ from sklearn.linear_model import LogisticRegression
 
 from nfl_pipeline.config import APPROVAL_FILE, FEATURES_DIR, MODELS_DIR, load_config
 from nfl_pipeline.feature_selection import select_features
+from nfl_pipeline.models.edge_model import FEATURES, EdgeModel, breakeven, build_edge_frame, roi_table
 from nfl_pipeline.models.game_ensemble import (TASK_KIND, GameEnsemble, classification_metrics, regression_metrics)
 from nfl_pipeline.models.player_model import (TARGET_POSITIONS, PlayerModel, player_metrics, target_kind)
 from nfl_pipeline.utils import log, timed
@@ -83,7 +84,7 @@ def _fit_win_stack(game_ids: np.ndarray, p_cls: np.ndarray, y: np.ndarray, mk: n
     if not path.exists() or not mpath.exists():
         log.warning("[win] margin OOF predictions not found; train the margin target first to enable stacking")
         return None, None
-    mo = pd.read_parquet(path).set_index("game_id")["oof_margin"]
+    mo = pd.read_parquet(path).set_index("game_id")["oof"]
     sigma = float(json.load(open(mpath))["sigma"])
     pm = pd.Series(game_ids).map(mo).to_numpy(dtype=float)
     ok = ~np.isnan(pm)
@@ -109,29 +110,36 @@ def _fit_win_stack(game_ids: np.ndarray, p_cls: np.ndarray, y: np.ndarray, mk: n
 # ---------------------------------------------------------------------------
 # Game models
 # ---------------------------------------------------------------------------
-def train_game_target(target: str, gf: pd.DataFrame, man: dict, cfg, args) -> dict:
+def train_game_target(target: str, gf: pd.DataFrame, man: dict, cfg, args, use_market: bool | None = None,
+                      name: str | None = None, min_train_seasons: int | None = None) -> dict:
+    """Gradient-boosting ensemble for one game target. ``name`` prefixes the saved artifacts (e.g. ``pf_margin``)."""
     kind = TASK_KIND[target]
+    name = name or target
     ycol = GAME_TARGET_COL[target]
     mcfg = cfg.get("models.game", {})
     vcfg = cfg.get("validation", {})
     df = gf[(gf["played"] == 1) & gf[ycol].notna()].reset_index(drop=True)
     feats = [c for c in man["features"] if c in df.columns]
-    market = man["families"].get("market", [])
-    use_market = mcfg.get("use_market_features", True) and not args.no_market
+    fam = man["families"]
+    market_all = fam.get("market", []) + fam.get("market_ratings", []) + fam.get("lines", [])
+    market = fam.get("market", [])
+    if use_market is None:
+        use_market = mcfg.get("use_market_features", True) and not args.no_market
     if not use_market:
-        feats = [c for c in feats if c not in market]
+        feats = [c for c in feats if c not in market_all]
     y = df[ycol].to_numpy(dtype=float)
     members = tuple(mcfg.get("ensemble_members", ["lgbm", "xgb", "cat"])) + (("ridge",) if not args.no_ridge else ())
     n_est = 120 if args.smoke else int(mcfg.get("n_estimators", 1500))
     lr = 0.1 if args.smoke else float(mcfg.get("learning_rate", 0.02))
     seed = int(mcfg.get("seed", 42))
 
-    folds = rolling_origin_folds(df, min_train_seasons=args.min_train_seasons or int(vcfg.get("min_train_seasons", 5)),
+    folds = rolling_origin_folds(df, min_train_seasons=min_train_seasons or args.min_train_seasons or int(vcfg.get("min_train_seasons", 5)),
                                  fold_unit=args.fold_unit or vcfg.get("fold_unit", "season"),
                                  es_tail_frac=float(vcfg.get("early_stop_tail_frac", 0.12)),
                                  max_folds=args.max_folds)
     assert_folds_are_causal(df, folds)
-    log.info("[%s] %s rows, %s candidate features, %s folds (%s .. %s)", target, len(df), len(feats), len(folds), folds[0].name, folds[-1].name)
+    log.info("[%s] %s rows, %s candidate features (market features %s), %s folds (%s .. %s)", name, len(df), len(feats),
+             "on" if use_market else "off", len(folds), folds[0].name, folds[-1].name)
 
     if args.smoke:
         cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = 2
@@ -199,10 +207,8 @@ def train_game_target(target: str, gf: pd.DataFrame, man: dict, cfg, args) -> di
         log.info("[%s] accuracy vs line by edge: %s", target, {k: (v["n"], round(v["acc"], 3)) for k, v in edge_table.items()})
 
     stack_report = None
-    if target == "margin":
-        pd.DataFrame({"game_id": df.loc[valid, "game_id"].to_numpy(), "oof_margin": blended}).to_parquet(
-            out_dir / "margin_oof.parquet", index=False)
-    elif target == "win":
+    pd.DataFrame({"game_id": df.loc[valid, "game_id"].to_numpy(), "oof": blended}).to_parquet(out_dir / f"{name}_oof.parquet", index=False)
+    if target == "win":
         final.stack_, stack_report = _fit_win_stack(df.loc[valid, "game_id"].to_numpy(), blended, y[valid.to_numpy()], mk, out_dir)
 
     # final fit: select on all played rows, fixed iterations from CV
@@ -211,17 +217,151 @@ def train_game_target(target: str, gf: pd.DataFrame, man: dict, cfg, args) -> di
         X = df[selected]
         fixed = {m: int(np.median(v) * 1.1) for m, v in best_iters.items()} if best_iters else None
         final.fit(X, y, fixed_iters=fixed)
-    final.save(out_dir / f"{target}.joblib")
+    final.save(out_dir / f"{name}.joblib")
     if len(report):
-        report.to_csv(out_dir / f"{target}_selection.csv")
-    metrics = {"target": target, "kind": kind, "n_rows": int(len(df)), "n_features_candidate": len(feats),
+        report.to_csv(out_dir / f"{name}_selection.csv")
+    metrics = {"target": target, "name": name, "kind": kind, "n_rows": int(len(df)), "n_features_candidate": len(feats),
                "n_features_selected": len(selected), "features": selected, "use_market_features": use_market,
                "n_features_by_fold": {k: len(v) for k, v in fold_features.items()}, "fold_features": fold_features,
                "members": list(members), "weights": final.weights_, "sigma": final.sigma_ if kind == "regression" else None,
                "platt": final.calib_ if kind == "classification" else None, "fixed_iters": fixed,
                "oof_overall": overall, "oof_by_member": per_member, "oof_by_season": per_season, "edge_buckets": edge_table,
                "win_stack": stack_report, "folds": fold_rows}
-    with open(out_dir / f"{target}_metrics.json", "w") as fh:
+    with open(out_dir / f"{name}_metrics.json", "w") as fh:
+        json.dump(metrics, fh, indent=2, default=float)
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: market-relative edge models (spread / total) against the opening line
+# ---------------------------------------------------------------------------
+def _calibration_bins(p_cover: np.ndarray, cover: np.ndarray) -> list[dict]:
+    conf = np.maximum(p_cover, 1 - p_cover)
+    side = np.where(p_cover >= 0.5, 1.0, -1.0)
+    edges = [0.5, 0.52, 0.54, 0.56, 0.58, 0.60, 1.01]
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf >= lo) & (conf < hi) & (cover != 0)
+        rows.append({"bin": f"{lo:.2f}-{min(hi, 1.0):.2f}", "n": int(m.sum()),
+                     "hit_rate": float(np.mean(side[m] == cover[m])) if m.any() else np.nan,
+                     "mean_p": float(conf[m].mean()) if m.any() else np.nan})
+    return rows
+
+
+def train_edge_target(task: str, gf: pd.DataFrame, cfg, args) -> dict:
+    out_dir = MODELS_DIR / "game"
+    pf = {}
+    for t in ("margin", "total"):
+        p = out_dir / f"pf_{t}_oof.parquet"
+        if not p.exists():
+            raise SystemExit(f"missing {p}: run the stage-1 power models first (python train_models.py --targets games)")
+        pf[t] = pd.read_parquet(p).set_index("game_id")["oof"]
+    df = gf[gf["played"] == 1].reset_index(drop=True)
+    e = build_edge_frame(df, df["game_id"].map(pf["margin"]).to_numpy(dtype=float),
+                         df["game_id"].map(pf["total"]).to_numpy(dtype=float), ref="open")
+    proto = EdgeModel(task)
+    ycol, ccol, rcol = proto.target_col, proto.cover_col, proto.ref_col
+    outcome_col = "home_margin" if task == "spread" else "total_points"
+    close_col = "spread_line" if task == "spread" else "total_line"
+    clv_col = "clv_spread" if task == "spread" else "clv_total"
+    e = e[e[ycol].notna() & e["pf_margin"].notna() & e["pf_total"].notna()].reset_index(drop=True)
+    drop = set(args.edge_drop or [])
+    feats = [c for c in FEATURES[task] if c in e.columns and c not in drop]
+    tag = f"_{args.tag}" if getattr(args, "tag", None) else ""
+    y = e[ycol].to_numpy(dtype=float)
+    cover = e[ccol].to_numpy(dtype=float)
+    vcfg = cfg.get("validation", {})
+    ecfg = cfg.get("models.edge", {})
+    mts = 1 if args.smoke else int(args.edge_min_train_seasons or vcfg.get("edge_min_train_seasons", 3))
+    folds = rolling_origin_folds(e, min_train_seasons=mts, es_tail_frac=float(vcfg.get("early_stop_tail_frac", 0.12)),
+                                 max_folds=args.max_folds)
+    assert_folds_are_causal(e, folds)
+    n_open = int((e["ref_is_open"] == 1).sum())
+    log.info("[edge_%s] %s rows (%s with true opening lines), %s features, %s folds (%s .. %s)", task, len(e), n_open,
+             len(feats), len(folds), folds[0].name, folds[-1].name)
+    X = e[feats]
+    n_bags = 1 if args.smoke else int(ecfg.get("n_bags", 3))
+    iterations = 100 if args.smoke else int(ecfg.get("iterations", 800))
+    oof = pd.DataFrame(np.nan, index=e.index, columns=["ridge", "cat", "p_cls"])
+    iters: list[dict] = []
+    fold_rows = []
+    for f in folds:
+        t0 = time.time()
+        m = EdgeModel(task, n_bags=n_bags, iterations=iterations)
+        m.fit(X.iloc[f.fit_idx], y[f.fit_idx], cover[f.fit_idx], X.iloc[f.es_idx], y[f.es_idx], cover[f.es_idx])
+        pm = m.predict_members(X.iloc[f.val_idx])
+        oof.iloc[f.val_idx] = pm.to_numpy()
+        iters.append(m.best_iters_)
+        yv, cv = y[f.val_idx], cover[f.val_idx]
+        live = cv != 0
+        row = {"fold": f.name, "n_train": len(f.train_idx), "n_val": len(f.val_idx), "secs": round(time.time() - t0, 1),
+               "ridge_mae": float(np.mean(np.abs(yv - pm["ridge"]))), "cat_mae": float(np.mean(np.abs(yv - pm["cat"]))),
+               "ref_mae": float(np.mean(np.abs(yv))),
+               "cls_hit": float(np.mean(np.sign(pm["p_cls"].to_numpy()[live] - 0.5) == cv[live])) if live.any() else np.nan}
+        fold_rows.append(row)
+        log.info("[edge_%s] fold %s: %s", task, f.name, _fmt({k: v for k, v in row.items() if k != "fold"}))
+
+    valid = oof.notna().all(axis=1).to_numpy()
+    ev = e.loc[valid].reset_index(drop=True)
+    final = EdgeModel(task, n_bags=n_bags, iterations=iterations)
+    final.fit_blend_and_calibration(oof[valid].reset_index(drop=True), y[valid], cover[valid],
+                                    outcome=ev[outcome_col].to_numpy() if task == "spread" else None,
+                                    ref_line=ev[rcol].to_numpy() if task == "spread" else None)
+    resid_pred = final.blend_resid(oof[valid].reset_index(drop=True))
+    p_cover = final.cover_prob(resid_pred, oof.loc[valid, "p_cls"].to_numpy())
+    outcome = ev[outcome_col].to_numpy(dtype=float)
+    ref = ev[rcol].to_numpy(dtype=float)
+    close = ev[close_col].to_numpy(dtype=float)
+    clv = ev[clv_col].to_numpy(dtype=float)
+    cov = cover[valid]
+    is_open = ev["ref_is_open"].to_numpy() == 1
+    mae = {"model": float(np.mean(np.abs(outcome - (ref + resid_pred)))), "ref_line": float(np.mean(np.abs(outcome - ref))),
+           "close_line": float(np.nanmean(np.abs(outcome - close))),
+           "model_open_rows": float(np.mean(np.abs(outcome[is_open] - (ref[is_open] + resid_pred[is_open])))) if is_open.any() else np.nan,
+           "open_line_open_rows": float(np.mean(np.abs(outcome[is_open] - ref[is_open]))) if is_open.any() else np.nan,
+           "close_line_open_rows": float(np.nanmean(np.abs(outcome[is_open] - close[is_open]))) if is_open.any() else np.nan}
+    report = {"all_rows": roi_table(p_cover, cov, clv),
+              "open_rows": roi_table(p_cover[is_open], cov[is_open], clv[is_open]) if is_open.any() else {},
+              "close_ref_rows": roi_table(p_cover[~is_open], cov[~is_open], None) if (~is_open).any() else {}}
+    calib_bins = _calibration_bins(p_cover, cov)
+    per_season = {}
+    for s in np.unique(ev["season"]):
+        sm = (ev["season"] == s).to_numpy()
+        rt = roi_table(p_cover[sm], cov[sm], clv[sm], thresholds=(0.50, 0.54), n_boot=200)
+        per_season[int(s)] = {"n": int(sm.sum()), "open_rows": int(is_open[sm].sum()), "flat": rt.get("p>=0.50", {}), "p54": rt.get("p>=0.54", {})}
+    win_report = None
+    if task == "spread":
+        mu = ref + resid_pred
+        p_norm = np.clip(norm.sf(-mu / final.sigma_), 1e-6, 1 - 1e-6)
+        p_win = expit(final.win_calib_["a"] * logit(p_norm) + final.win_calib_["b"]) if final.win_calib_ else p_norm
+        yw = (outcome > 0).astype(float)
+        mk = ev["home_ml_prob_novig"].to_numpy(dtype=float) if "home_ml_prob_novig" in ev else None
+        win_report = classification_metrics(yw, p_win, mk)
+    log.info("[edge_%s] OOF MAE model %.3f | ref line %.3f | close line %.3f  (open-line rows: model %.3f open %.3f close %.3f)",
+             task, mae["model"], mae["ref_line"], mae["close_line"], mae["model_open_rows"], mae["open_line_open_rows"], mae["close_line_open_rows"])
+    for label, key in (("OPEN", "open_rows"), ("ALL", "all_rows")):
+        for thr, r in report[key].items():
+            if r.get("n", 0) >= 20:
+                log.info("[edge_%s] vs %s line %s: n=%s hit=%.3f roi=%+.1f%% [%+.1f, %+.1f] P(roi>0)=%.2f clv=%+.2f", task, label, thr,
+                         r["n"], r["hit_rate"], 100 * r["roi"], 100 * r["roi_ci_low"], 100 * r["roi_ci_high"], r["p_roi_positive"], r.get("clv_pts", np.nan))
+
+    with timed(f"[edge_{task}] final fit"):
+        fixed = {k: int(np.median([d[k] for d in iters if k in d]) * 1.1) for k in ("cat", "cls") if any(k in d for d in iters)} or None
+        final.fit(X, y, cover, fixed_iters=fixed)
+    final.save(out_dir / f"edge_{task}{tag}.joblib")
+    oof_out = ev[["game_id", "season", "week", "home_team", "away_team", rcol, close_col, outcome_col, "ref_is_open"]].copy()
+    oof_out["resid_pred"] = resid_pred
+    oof_out["p_cover"] = p_cover
+    oof_out["p_cls"] = oof.loc[valid, "p_cls"].to_numpy()
+    oof_out["cover"] = cov
+    oof_out["clv"] = clv
+    oof_out.to_parquet(out_dir / f"edge_{task}{tag}_oof.parquet", index=False)
+    metrics = {"task": task, "n_rows": int(len(e)), "n_open_rows": n_open, "n_oof": int(valid.sum()), "n_oof_open": int(is_open.sum()),
+               "features": feats, "weights": final.weights_, "sigma": final.sigma_, "calib": final.calib_, "win_calib": final.win_calib_,
+               "fixed_iters": fixed, "mae": mae, "roi": report, "calibration_bins": calib_bins, "by_season": per_season,
+               "win_prob": win_report, "breakeven_110": breakeven(-110.0), "folds": fold_rows}
+    metrics["dropped_features"] = sorted(drop)
+    with open(out_dir / f"edge_{task}{tag}_metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
     return metrics
 
@@ -311,14 +451,21 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--targets", nargs="*", default=None, help="subset of: margin total win players <player_target>")
+    ap.add_argument("--targets", nargs="*", default=None,
+                    help="subset of: games (stage 1 + edge), edge (stage 2 only), players, <player_target>, "
+                         "or the legacy market-aware targets margin total win")
     ap.add_argument("--approve-features", action="store_true", help="approve the engineered features and proceed")
     ap.add_argument("--smoke", action="store_true", help="tiny models, 2 folds: verifies the pipeline end-to-end")
-    ap.add_argument("--no-market", action="store_true", help="exclude closing-line features (pure power-rating model)")
-    ap.add_argument("--no-ridge", action="store_true", help="drop the linear stabiliser from the game ensemble")
+    ap.add_argument("--no-market", action="store_true", help="legacy targets only: exclude market features")
+    ap.add_argument("--no-ridge", action="store_true", help="drop the linear stabiliser from the stage-1 ensemble")
     ap.add_argument("--skip-selection", action="store_true")
+    ap.add_argument("--selection-shuffles", type=int, default=None, help="null-importance shuffles for stage 1 (default 4)")
     ap.add_argument("--fold-unit", default=None, choices=[None, "season", "half", "week"])
     ap.add_argument("--min-train-seasons", type=int, default=None)
+    ap.add_argument("--stage1-min-train-seasons", type=int, default=None, help="stage-1 power models (default 3)")
+    ap.add_argument("--edge-min-train-seasons", type=int, default=None, help="stage-2 edge models (default 3)")
+    ap.add_argument("--edge-drop", nargs="*", default=None, help="edge models: feature names to exclude (ablation)")
+    ap.add_argument("--tag", default=None, help="suffix for edge-model artifacts, e.g. --tag noweather (keeps the main models intact)")
     ap.add_argument("--max-folds", type=int, default=None, help="evaluate only the most recent N folds")
     ap.add_argument("--player-max-folds", type=int, default=4, help="player models: most recent N season folds")
     ap.add_argument("--player-model", default=None, choices=[None, "nn", "gbm", "blend"])
@@ -336,24 +483,50 @@ def main() -> None:
         args.min_train_seasons = args.min_train_seasons or 10
         args.player_max_folds = min(args.player_max_folds, 2)
 
-    targets = args.targets or (list(cfg.get("models.game.targets", [])) + ["players"])
-    game_targets = [t for t in targets if t in GAME_TARGET_COL]
-    player_targets = []
+    targets = args.targets or ["games", "players"]
+    stage1, edge_tasks, legacy, player_targets = [], [], [], []
     for t in targets:
-        if t == "players":
+        if t == "games":
+            stage1 += ["margin", "total"]
+            edge_tasks += ["spread", "total"]
+        elif t == "edge":
+            edge_tasks += ["spread", "total"]
+        elif t in ("edge_spread", "edge_total"):
+            edge_tasks.append(t.split("_")[1])
+        elif t in GAME_TARGET_COL:
+            legacy.append(t)
+        elif t == "players":
             player_targets += list(cfg.get("models.player.targets", []))
         elif t in TARGET_POSITIONS:
             player_targets.append(t)
+        else:
+            raise SystemExit(f"unknown target {t}")
+    edge_tasks = list(dict.fromkeys(edge_tasks))
 
-    summary = {"game": {}, "player": {}, "smoke": args.smoke, "no_market": args.no_market}
-    if game_targets:
+    summary = {"stage1": {}, "edge": {}, "game": {}, "player": {}, "smoke": args.smoke}
+    if stage1 or edge_tasks or legacy:
         gf = pd.read_parquet(FEATURES_DIR / "game_features.parquet")
         man = json.load(open(FEATURES_DIR / "game_manifest.json"))
-        for t in game_targets:
-            with timed(f"GAME MODEL: {t}"):
-                m = train_game_target(t, gf, man, cfg, args)
-            summary["game"][t] = {"oof": m["oof_overall"], "weights": m["weights"], "n_features": m["n_features_selected"],
-                                  "edge_buckets": m.get("edge_buckets")}
+    if stage1:
+        shuffles_saved = cfg.get("feature_selection.null_importance_shuffles", 8)
+        cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = int(args.selection_shuffles or 4)
+        s1 = args.stage1_min_train_seasons or int(cfg.get("validation.stage1_min_train_seasons", 3))
+        for t in stage1:
+            with timed(f"STAGE 1 (market-free) MODEL: pf_{t}"):
+                m = train_game_target(t, gf, man, cfg, args, use_market=False, name=f"pf_{t}",
+                                      min_train_seasons=None if args.smoke else s1)
+            summary["stage1"][f"pf_{t}"] = {"oof": m["oof_overall"], "weights": m["weights"], "n_features": m["n_features_selected"]}
+        cfg.raw["feature_selection"]["null_importance_shuffles"] = shuffles_saved
+    for task in edge_tasks:
+        with timed(f"EDGE MODEL: {task}"):
+            m = train_edge_target(task, gf, cfg, args)
+        summary["edge"][task] = {"mae": m["mae"], "roi_open": m["roi"]["open_rows"], "roi_all": m["roi"]["all_rows"],
+                                 "n_oof": m["n_oof"], "n_oof_open": m["n_oof_open"], "weights": m["weights"], "win_prob": m["win_prob"]}
+    for t in legacy:
+        with timed(f"LEGACY GAME MODEL: {t}"):
+            m = train_game_target(t, gf, man, cfg, args)
+        summary["game"][t] = {"oof": m["oof_overall"], "weights": m["weights"], "n_features": m["n_features_selected"],
+                              "edge_buckets": m.get("edge_buckets")}
     if player_targets:
         pf = pd.read_parquet(FEATURES_DIR / "player_features.parquet")
         pman = json.load(open(FEATURES_DIR / "player_manifest.json"))
@@ -365,6 +538,21 @@ def main() -> None:
         json.dump(summary, fh, indent=2, default=float)
 
     print("\n" + "=" * 78 + "\nTRAINING SUMMARY (out-of-fold, rolling origin)\n" + "=" * 78)
+    for t, m in summary["stage1"].items():
+        print(f"[stage1/{t}] features={m['n_features']}  weights={ {k: round(v, 2) for k, v in m['weights'].items()} }")
+        print("   " + _fmt(m["oof"]))
+    for t, m in summary["edge"].items():
+        mae = m["mae"]
+        print(f"[edge/{t}] OOF rows={m['n_oof']} (true-open rows {m['n_oof_open']})  blend={ {k: round(v, 2) for k, v in m['weights'].items()} }")
+        print(f"   MAE: model {mae['model']:.3f} | reference line {mae['ref_line']:.3f} | closing line {mae['close_line']:.3f}")
+        for label, key in (("vs OPENING line", "roi_open"), ("vs all reference lines", "roi_all")):
+            for thr, r in m[key].items():
+                if r.get("n", 0) >= 20:
+                    print(f"   {label:<24} {thr}: n={r['n']:<5} hit={r['hit_rate']:.3f}  ROI={100 * r['roi']:+.1f}% "
+                          f"[{100 * r['roi_ci_low']:+.1f}, {100 * r['roi_ci_high']:+.1f}]  P(ROI>0)={r['p_roi_positive']:.2f}  CLV={r.get('clv_pts', float('nan')):+.2f} pts")
+        if m.get("win_prob"):
+            w = m["win_prob"]
+            print(f"   win prob: logloss {w['logloss']:.4f} vs market {w.get('market_logloss', float('nan')):.4f}")
     for t, m in summary["game"].items():
         print(f"[game/{t}] features={m['n_features']}  weights={ {k: round(v, 2) for k, v in m['weights'].items()} }")
         print("   " + _fmt(m["oof"]))

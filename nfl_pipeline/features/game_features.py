@@ -22,6 +22,10 @@ import pandas as pd
 from ..config import Config, FEATURES_DIR
 from ..utils import log, timed
 from .context import CONTEXT_FEATURES, MARKET_FEATURES, build_game_context
+from .market import MARKET_RATING_FEATURES, market_implied_ratings
+from ..lines import load_lines
+
+LINE_FEATURES = ["spread_open", "total_open", "ml_h_open", "ml_a_open", "spread_close_espn", "total_close_espn", "n_books"]
 from .rolling import add_rolling_features
 from .team_efficiency import metric_columns
 
@@ -90,7 +94,7 @@ def roll_team_games(tg: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, dict[s
     hl = fcfg.get("ewma_halflife", 4.0)
     shrink = fcfg.get("ewma_prior_shrink", 0.6)
     cross = fcfg.get("rolling_cross_season", True)
-    base = metric_columns(tg)
+    base = metric_columns(tg) + [c for c in ("ats_cover_margin", "ats_over_margin") if c in tg.columns]
     with timed("rolling: raw team metrics"):
         tg = add_rolling_features(tg, base, "team", "gameday", windows=windows, ewm_halflife=hl,
                                   ewm_shrink=shrink, cross_season=cross, order_cols=["gameday", "week"])
@@ -122,7 +126,7 @@ def build_game_features(tg_rolled: pd.DataFrame, schedules: pd.DataFrame, cfg: C
     # per-side feature lists
     ewm_all = [f"{c}_ewm" for c in base + adj if f"{c}_ewm" in tg_rolled]
     core_cols = [f"{s}_{m}" for s in ("off", "def") for m in CORE_METRICS + LINE_METRICS if f"{s}_{m}" in base]
-    core_cols += adj
+    core_cols += adj + [c for c in ("ats_cover_margin", "ats_over_margin") if c in base]
     recent = [f"{c}_{w}" for c in core_cols for w in windows if w != "ewm" and f"{c}_{w}" in tg_rolled]
     side_cols = ewm_all + recent + families["qb"] + ["n_prior_games", "n_prior_games_season"]
     side_cols = list(dict.fromkeys(side_cols))
@@ -169,6 +173,17 @@ def build_game_features(tg_rolled: pd.DataFrame, schedules: pd.DataFrame, cfg: C
     # context + market
     ctx = build_game_context(schedules[schedules["game_id"].isin(g["game_id"])], cfg)
     g = g.merge(ctx.drop(columns=["season", "week"]), on="game_id", how="left")
+    # market-implied ratings from prior closing lines (all schedule seasons, so week 1 sees last season)
+    mkt = market_implied_ratings(schedules)
+    g = g.merge(mkt[["game_id"] + MARKET_RATING_FEATURES], on="game_id", how="left")
+    # opening / closing lines from the ESPN odds feed (see nfl_pipeline/lines.py); NaN where no open is known
+    lines = load_lines()
+    g = g.merge(lines[["game_id"] + [c for c in LINE_FEATURES if c in lines.columns]], on="game_id", how="left")
+    for c in LINE_FEATURES:
+        if c not in g:
+            g[c] = np.nan
+    g["open_to_close_move"] = g["spread_line"] - g["spread_open"]
+    log.info("lines: opening spread known for %s of %s games", int(g["spread_open"].notna().sum()), len(g))
 
     # targets
     tgt = {}
@@ -194,6 +209,8 @@ def build_game_features(tg_rolled: pd.DataFrame, schedules: pd.DataFrame, cfg: C
         "experience": ["home_n_prior_games", "away_n_prior_games", "home_n_prior_games_season", "away_n_prior_games_season", "d_n_prior_games_season"],
         "context": CONTEXT_FEATURES,
         "market": MARKET_FEATURES,
+        "market_ratings": MARKET_RATING_FEATURES,
+        "lines": LINE_FEATURES,
     }
     all_feats = [c for f in fam.values() for c in f if c in g.columns]
     all_feats = list(dict.fromkeys(all_feats))

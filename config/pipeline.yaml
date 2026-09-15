@@ -40,7 +40,9 @@ feature_selection:
   max_keep: 160
 
 validation:
-  min_train_seasons: 5             # first validation fold trains on this many seasons
+  min_train_seasons: 5             # legacy market-aware game models: first fold trains on this many seasons
+  stage1_min_train_seasons: 3      # market-free power models (need OOF predictions early for stage 2)
+  edge_min_train_seasons: 3        # stage-2 edge models
   fold_unit: season                # rolling-origin block size: "season" or "week"
   early_stop_tail_frac: 0.12       # chronological tail of TRAIN used for early stopping
 
@@ -52,6 +54,9 @@ models:
     n_estimators: 1500
     learning_rate: 0.02
     seed: 42
+  edge:                            # stage-2 market-relative models (spread / total vs the opening line)
+    n_bags: 3                      # CatBoost bag size (regressor and cover classifier)
+    iterations: 800                # max trees per bag member (early-stopped in CV)
   player:
     targets: [passing_yards, passing_tds, rushing_yards, rushing_tds, receiving_yards, receiving_tds]
     model_type: blend              # "nn" | "gbm" | "blend"
