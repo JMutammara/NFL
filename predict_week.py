@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.special import expit, logit
 from scipy.stats import norm
 
 from nfl_pipeline.config import FEATURES_DIR, MODELS_DIR, PREDICTIONS_DIR, load_config
@@ -104,9 +105,20 @@ def predict_games(g: pd.DataFrame, models: dict[str, GameEnsemble], sched: pd.Da
         out["total_edge_pct"] = market_edge_pct(out["total_pick_p"], odds)
         out["total_stake"] = kelly_fraction(out["total_pick_p"], odds, kf, cap) * bankroll
     if "win" in models:
-        p_cls = models["win"].predict(g)
+        wm = models["win"]
+        p_cls = np.clip(wm.predict(g), 1e-6, 1 - 1e-6)
         out["p_home_win_classifier"] = p_cls
-        out["p_home_win"] = 0.5 * (p_cls + out["p_home_win_from_margin"]) if "p_home_win_from_margin" in out else p_cls
+        stack = getattr(wm, "stack_", None)
+        if stack and "model_margin" in out:
+            # learned logistic stack over the classifier and the margin-implied probability (fit on OOF predictions)
+            sig_m = models["margin"].sigma_ if np.isfinite(models["margin"].sigma_) else stack["margin_sigma"]
+            p_margin = np.clip(norm.sf(-out["model_margin"].to_numpy() / sig_m), 1e-6, 1 - 1e-6)
+            z = stack["coef_cls"] * logit(p_cls) + stack["coef_margin"] * logit(p_margin) + stack["intercept"]
+            out["p_home_win"] = expit(z)
+        elif "p_home_win_from_margin" in out:
+            out["p_home_win"] = 0.5 * (p_cls + out["p_home_win_from_margin"])
+        else:
+            out["p_home_win"] = p_cls
     elif "p_home_win_from_margin" in out:
         out["p_home_win"] = out["p_home_win_from_margin"]
     if "p_home_win" in out:

@@ -90,7 +90,9 @@ through the package instead. Coverage used by default:
   expanding league mean computed over earlier dates only.
 * Rolling-origin CV trains on `(season, week)` strictly before each block;
   early stopping uses a chronological tail of the training rows only.
-* Feature selection runs on the rows before the first validation block.
+* Feature selection runs inside every CV fold on that fold's training rows
+  only; the final model re-selects on all played rows. Per-fold feature lists
+  are stored in each `<target>_metrics.json`.
 * Weather for future games is imputed from climatology and flagged.
 
 ## Outputs
@@ -123,5 +125,7 @@ next `train_models.py` run.
 * Margin and total residual sigma come from out-of-fold residuals; player
   sigma is learned per row and rescaled so standardised OOF residuals have
   unit variance.
-* Win probability blends the calibrated classifier with the probability
-  implied by the margin model.
+* Win probability is a logistic stack of the calibrated classifier and the
+  probability implied by the margin model, with the two weights fitted on
+  out-of-fold predictions (`win_stack` in `win_metrics.json`). Train `margin`
+  before `win`; without a margin OOF file the stack falls back to a 50/50 blend.

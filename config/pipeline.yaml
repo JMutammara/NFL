@@ -30,7 +30,8 @@ features:
   dome_wind_mph: 0.0
 
 feature_selection:
-  max_missing_frac: 0.70           # drop features missing more than this share of rows
+  max_missing_frac: 0.80           # drop features missing more than this share of the selection rows
+                                   # (0.80 lets 2022+ charting features survive a 2012+ training window)
   min_variance: 1.0e-8
   corr_threshold: 0.92             # collinearity clustering threshold (|Spearman|)
   null_importance_shuffles: 8      # permuted-target refits for the noise filter

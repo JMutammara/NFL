@@ -74,6 +74,7 @@ class GameEnsemble:
     best_iters_: dict[str, int] = field(default_factory=dict)
     weights_: dict[str, float] = field(default_factory=dict)
     calib_: tuple[float, float] = (1.0, 0.0)  # Platt (a, b) on blended logit
+    stack_: dict | None = None  # win task only: logistic stack over (classifier, margin-implied) logits
     sigma_: float = np.nan
     features_: list[str] = field(default_factory=list)
 

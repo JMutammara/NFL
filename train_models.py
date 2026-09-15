@@ -35,6 +35,9 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from scipy.special import expit, logit
+from scipy.stats import norm
+from sklearn.linear_model import LogisticRegression
 
 from nfl_pipeline.config import APPROVAL_FILE, FEATURES_DIR, MODELS_DIR, load_config
 from nfl_pipeline.feature_selection import select_features
@@ -49,6 +52,58 @@ GAME_MARKET_COL = {"margin": "spread_line", "total": "total_line", "win": "home_
 
 def _fmt(d: dict) -> str:
     return "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in d.items())
+
+
+def _select(rows: pd.DataFrame, y_rows: np.ndarray, feats: list[str], kind: str, cfg, seed: int,
+            always_keep: list[str], args) -> tuple[list[str], pd.DataFrame]:
+    """Feature selection restricted to ``rows``.
+
+    Called once per CV fold with that fold's *training* rows (so selection can
+    never see the fold's validation outcomes) and once more with every played
+    row for the final fit.
+    """
+    if args.skip_selection:
+        return feats, pd.DataFrame()
+    res = select_features(rows[feats], y_rows, kind, cfg, seed=seed, always_keep=always_keep)
+    return res["selected"], res["report"]
+
+
+def _clip_p(p) -> np.ndarray:
+    return np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
+
+
+def _fit_win_stack(game_ids: np.ndarray, p_cls: np.ndarray, y: np.ndarray, mk: np.ndarray, out_dir) -> tuple[dict | None, dict | None]:
+    """Stack the win classifier with the margin model's implied win probability.
+
+    Both inputs are out-of-fold, so the two logit weights are an honest estimate
+    of how much each source deserves. Returns (None, None) when no margin OOF
+    file exists, in which case predict_week.py uses a fixed 50/50 blend.
+    """
+    path, mpath = out_dir / "margin_oof.parquet", out_dir / "margin_metrics.json"
+    if not path.exists() or not mpath.exists():
+        log.warning("[win] margin OOF predictions not found; train the margin target first to enable stacking")
+        return None, None
+    mo = pd.read_parquet(path).set_index("game_id")["oof_margin"]
+    sigma = float(json.load(open(mpath))["sigma"])
+    pm = pd.Series(game_ids).map(mo).to_numpy(dtype=float)
+    ok = ~np.isnan(pm)
+    if ok.sum() < 200:
+        log.warning("[win] only %s games overlap the margin OOF; skipping stacking", int(ok.sum()))
+        return None, None
+    p_margin = norm.sf(-pm[ok] / sigma)
+    Z = np.column_stack([logit(_clip_p(p_cls[ok])), logit(_clip_p(p_margin))])
+    lr = LogisticRegression(C=1e6, max_iter=1000).fit(Z, y[ok].astype(int))
+    stack = {"coef_cls": float(lr.coef_[0][0]), "coef_margin": float(lr.coef_[0][1]),
+             "intercept": float(lr.intercept_[0]), "margin_sigma": sigma}
+    p_stack = expit(Z @ lr.coef_[0] + lr.intercept_[0])
+    report = {"n": int(ok.sum()), "stacked": classification_metrics(y[ok], p_stack, mk[ok]),
+              "margin_only": classification_metrics(y[ok], p_margin, mk[ok]),
+              "classifier_only": classification_metrics(y[ok], p_cls[ok], mk[ok]), "weights": stack}
+    log.info("[win] stack weights: classifier %.3f, margin %.3f, intercept %.3f | stacked logloss %.4f (classifier %.4f, "
+             "margin-only %.4f, market %.4f)", stack["coef_cls"], stack["coef_margin"], stack["intercept"],
+             report["stacked"]["logloss"], report["classifier_only"]["logloss"], report["margin_only"]["logloss"],
+             report["stacked"]["market_logloss"])
+    return stack, report
 
 
 # ---------------------------------------------------------------------------
@@ -78,34 +133,31 @@ def train_game_target(target: str, gf: pd.DataFrame, man: dict, cfg, args) -> di
     assert_folds_are_causal(df, folds)
     log.info("[%s] %s rows, %s candidate features, %s folds (%s .. %s)", target, len(df), len(feats), len(folds), folds[0].name, folds[-1].name)
 
-    # feature selection on data strictly before the first validation block
-    with timed(f"[{target}] feature selection"):
-        sel_idx = folds[0].train_idx
-        if args.skip_selection:
-            selected = feats
-            report = pd.DataFrame()
-        else:
-            if args.smoke:
-                cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = 2
-            res = select_features(df.iloc[sel_idx][feats], y[sel_idx], kind, cfg, seed=seed,
-                                  always_keep=(market if use_market else []) + ["is_neutral", "rest_diff", "week"])
-            selected, report = res["selected"], res["report"]
-    X = df[selected]
+    if args.smoke:
+        cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = 2
+    always_keep = (market if use_market else []) + ["is_neutral", "rest_diff", "week"]
+    out_dir = MODELS_DIR / "game"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # rolling-origin CV
+    # rolling-origin CV; every fold selects features on its own training rows only
     oof = pd.DataFrame(np.nan, index=df.index, columns=list(members))
     best_iters = defaultdict(list)
     fold_rows = []
+    fold_features: dict[str, list[str]] = {}
     for f in folds:
         t0 = time.time()
+        sel_f, _ = _select(df.iloc[f.train_idx], y[f.train_idx], feats, kind, cfg, seed, always_keep, args)
+        fold_features[f.name] = sel_f
+        Xf = df[sel_f]
         ens = GameEnsemble(target, members, n_est, lr, seed)
-        ens.fit(X.iloc[f.fit_idx], y[f.fit_idx], X.iloc[f.es_idx], y[f.es_idx])
-        preds = ens.predict_members(X.iloc[f.val_idx])
+        ens.fit(Xf.iloc[f.fit_idx], y[f.fit_idx], Xf.iloc[f.es_idx], y[f.es_idx])
+        preds = ens.predict_members(Xf.iloc[f.val_idx])
         oof.iloc[f.val_idx] = preds.to_numpy()
         for m, it in ens.best_iters_.items():
             best_iters[m].append(it)
         mk = df.iloc[f.val_idx][GAME_MARKET_COL[target]].to_numpy()
-        row = {"fold": f.name, "n_train": len(f.train_idx), "n_val": len(f.val_idx), "secs": round(time.time() - t0, 1)}
+        row = {"fold": f.name, "n_train": len(f.train_idx), "n_val": len(f.val_idx), "n_features": len(sel_f),
+               "secs": round(time.time() - t0, 1)}
         for m in members:
             met = (classification_metrics(y[f.val_idx], preds[m], mk) if kind == "classification"
                    else regression_metrics(y[f.val_idx], preds[m], mk))
@@ -146,20 +198,29 @@ def train_game_target(target: str, gf: pd.DataFrame, man: dict, cfg, args) -> di
     if edge_table:
         log.info("[%s] accuracy vs line by edge: %s", target, {k: (v["n"], round(v["acc"], 3)) for k, v in edge_table.items()})
 
-    # final fit on all rows with fixed iterations from CV
-    with timed(f"[{target}] final fit"):
+    stack_report = None
+    if target == "margin":
+        pd.DataFrame({"game_id": df.loc[valid, "game_id"].to_numpy(), "oof_margin": blended}).to_parquet(
+            out_dir / "margin_oof.parquet", index=False)
+    elif target == "win":
+        final.stack_, stack_report = _fit_win_stack(df.loc[valid, "game_id"].to_numpy(), blended, y[valid.to_numpy()], mk, out_dir)
+
+    # final fit: select on all played rows, fixed iterations from CV
+    with timed(f"[{target}] final selection + fit"):
+        selected, report = _select(df, y, feats, kind, cfg, seed, always_keep, args)
+        X = df[selected]
         fixed = {m: int(np.median(v) * 1.1) for m, v in best_iters.items()} if best_iters else None
         final.fit(X, y, fixed_iters=fixed)
-    out_dir = MODELS_DIR / "game"
     final.save(out_dir / f"{target}.joblib")
     if len(report):
         report.to_csv(out_dir / f"{target}_selection.csv")
     metrics = {"target": target, "kind": kind, "n_rows": int(len(df)), "n_features_candidate": len(feats),
                "n_features_selected": len(selected), "features": selected, "use_market_features": use_market,
+               "n_features_by_fold": {k: len(v) for k, v in fold_features.items()}, "fold_features": fold_features,
                "members": list(members), "weights": final.weights_, "sigma": final.sigma_ if kind == "regression" else None,
                "platt": final.calib_ if kind == "classification" else None, "fixed_iters": fixed,
                "oof_overall": overall, "oof_by_member": per_member, "oof_by_season": per_season, "edge_buckets": edge_table,
-               "folds": fold_rows}
+               "win_stack": stack_report, "folds": fold_rows}
     with open(out_dir / f"{target}_metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
     return metrics
@@ -193,32 +254,29 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
     log.info("[%s] %s rows (%s), %s features, %s folds (%s .. %s)", target, len(df), "/".join(TARGET_POSITIONS[target]),
              len(feats), len(folds), folds[0].name, folds[-1].name)
 
-    with timed(f"[{target}] feature selection"):
-        if args.skip_selection:
-            selected, report = feats, pd.DataFrame()
-        else:
-            if args.smoke:
-                cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = 2
-            res = select_features(df.iloc[folds[0].train_idx][feats], y[folds[0].train_idx], "regression", cfg, seed=seed,
-                                  always_keep=["is_home", "team_spread", "total_line", "team_implied_pts", "inj_status", "depth_rank",
-                                               "pos_QB", "pos_RB", "pos_WR", "pos_TE", f"{target}_ewm", f"{target}_r3"])
-            selected, report = res["selected"], res["report"]
-    X = df[selected]
+    if args.smoke:
+        cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = 2
+    always_keep = ["is_home", "team_spread", "total_line", "team_implied_pts", "inj_status", "depth_rank",
+                   "pos_QB", "pos_RB", "pos_WR", "pos_TE", f"{target}_ewm", f"{target}_r3"]
 
     oof_mu = np.full(len(df), np.nan)
     oof_sigma = np.full(len(df), np.nan)
     fold_rows = []
+    fold_features: dict[str, list[str]] = {}
     for f in folds:
         t0 = time.time()
+        sel_f, _ = _select(df.iloc[f.train_idx], y[f.train_idx], feats, "regression", cfg, seed, always_keep, args)
+        fold_features[f.name] = sel_f
+        Xf = df[sel_f]
         model = PlayerModel(target, model_type, nn_params, gbm_params, seed)
-        model.fit(X.iloc[f.fit_idx], y[f.fit_idx], X.iloc[f.es_idx], y[f.es_idx])
-        d = model.predict_dist(X.iloc[f.val_idx])
+        model.fit(Xf.iloc[f.fit_idx], y[f.fit_idx], Xf.iloc[f.es_idx], y[f.es_idx])
+        d = model.predict_dist(Xf.iloc[f.val_idx])
         oof_mu[f.val_idx], oof_sigma[f.val_idx] = d["mu"].to_numpy(), d["sigma"].to_numpy()
         met = player_metrics(y[f.val_idx], oof_mu[f.val_idx], oof_sigma[f.val_idx], kind)
         # naive baseline: player's EWM of the target
         base = df.iloc[f.val_idx][f"{target}_ewm"].fillna(df.iloc[f.val_idx][target].mean()).to_numpy()
         met["baseline_ewm_mae"] = float(np.mean(np.abs(y[f.val_idx] - base)))
-        met.update(fold=f.name, secs=round(time.time() - t0, 1))
+        met.update(fold=f.name, n_features=len(sel_f), secs=round(time.time() - t0, 1))
         fold_rows.append(met)
         log.info("[%s] fold %s: %s", target, f.name, _fmt({k: v for k, v in met.items() if k != "fold"}))
 
@@ -228,7 +286,9 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
     overall["baseline_ewm_mae"] = float(np.mean(np.abs(y[valid] - base)))
     log.info("[%s] OOF: %s", target, _fmt(overall))
 
-    with timed(f"[{target}] final fit"):
+    with timed(f"[{target}] final selection + fit"):
+        selected, report = _select(df, y, feats, "regression", cfg, seed, always_keep, args)
+        X = df[selected]
         final = PlayerModel(target, model_type, nn_params, gbm_params, seed)
         final.calibrate_sigma(y[valid], oof_mu[valid], oof_sigma[valid])
         # early-stopping set: random 10% of the most recent three seasons (keeps recency in training)
@@ -242,6 +302,7 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
         report.to_csv(out_dir / f"{target}_selection.csv")
     metrics = {"target": target, "kind": kind, "positions": TARGET_POSITIONS[target], "n_rows": int(len(df)),
                "n_features_selected": len(selected), "features": selected, "model_type": model_type,
+               "n_features_by_fold": {k: len(v) for k, v in fold_features.items()}, "fold_features": fold_features,
                "sigma_scale": final.sigma_scale_, "oof_overall": overall, "folds": fold_rows}
     with open(out_dir / f"{target}_metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
