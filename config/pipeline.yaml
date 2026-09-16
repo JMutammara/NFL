@@ -60,6 +60,10 @@ models:
   player:
     targets: [passing_yards, passing_tds, rushing_yards, rushing_tds, receiving_yards, receiving_tds]
     model_type: blend              # "nn" | "gbm" | "blend"
+    transforms:                    # Gaussian head fitted on a transformed target; quantiles / P(over) map back
+      passing_yards: none          # roughly symmetric
+      rushing_yards: log1p         # zero-heavy and right-skewed
+      receiving_yards: log1p
     nn:
       hidden: [256, 128, 64]
       dropout: 0.15

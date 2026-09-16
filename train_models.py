@@ -41,9 +41,10 @@ from sklearn.linear_model import LogisticRegression
 
 from nfl_pipeline.config import APPROVAL_FILE, FEATURES_DIR, MODELS_DIR, load_config
 from nfl_pipeline.feature_selection import select_features
-from nfl_pipeline.models.edge_model import FEATURES, EdgeModel, breakeven, build_edge_frame, roi_table
+from nfl_pipeline.models.edge_model import FEATURES, EdgeModel, breakeven, build_edge_frame, probability_scores, roi_table
 from nfl_pipeline.models.game_ensemble import (TASK_KIND, GameEnsemble, classification_metrics, regression_metrics)
-from nfl_pipeline.models.player_model import (TARGET_POSITIONS, PlayerModel, player_metrics, target_kind)
+from nfl_pipeline.models.player_model import (DEFAULT_TRANSFORMS, TARGET_POSITIONS, PlayerModel, dist_mean, dist_prob_over,
+                                              dist_quantile, player_metrics, prop_probability_report, target_kind)
 from nfl_pipeline.utils import log, timed
 from nfl_pipeline.validation import assert_folds_are_causal, rolling_origin_folds
 
@@ -282,13 +283,18 @@ def train_edge_target(task: str, gf: pd.DataFrame, cfg, args) -> dict:
     X = e[feats]
     n_bags = 1 if args.smoke else int(ecfg.get("n_bags", 3))
     iterations = 100 if args.smoke else int(ecfg.get("iterations", 800))
+    use_cls = not args.edge_no_cls and bool(ecfg.get("use_cls", True))
+    recency = args.edge_recency_halflife if args.edge_recency_halflife is not None else ecfg.get("recency_halflife")
+    recency = float(recency) if recency else None
+    seasons_all = e["season"].to_numpy()
+    log.info("[edge_%s] classifier %s, recency halflife %s seasons", task, "on" if use_cls else "off", recency or "none")
     oof = pd.DataFrame(np.nan, index=e.index, columns=["ridge", "cat", "p_cls"])
     iters: list[dict] = []
     fold_rows = []
     for f in folds:
         t0 = time.time()
-        m = EdgeModel(task, n_bags=n_bags, iterations=iterations)
-        m.fit(X.iloc[f.fit_idx], y[f.fit_idx], cover[f.fit_idx], X.iloc[f.es_idx], y[f.es_idx], cover[f.es_idx])
+        m = EdgeModel(task, n_bags=n_bags, iterations=iterations, use_cls=use_cls, recency_halflife=recency)
+        m.fit(X.iloc[f.fit_idx], y[f.fit_idx], cover[f.fit_idx], X.iloc[f.es_idx], y[f.es_idx], cover[f.es_idx], seasons=seasons_all[f.fit_idx])
         pm = m.predict_members(X.iloc[f.val_idx])
         oof.iloc[f.val_idx] = pm.to_numpy()
         iters.append(m.best_iters_)
@@ -303,7 +309,7 @@ def train_edge_target(task: str, gf: pd.DataFrame, cfg, args) -> dict:
 
     valid = oof.notna().all(axis=1).to_numpy()
     ev = e.loc[valid].reset_index(drop=True)
-    final = EdgeModel(task, n_bags=n_bags, iterations=iterations)
+    final = EdgeModel(task, n_bags=n_bags, iterations=iterations, use_cls=use_cls, recency_halflife=recency)
     final.fit_blend_and_calibration(oof[valid].reset_index(drop=True), y[valid], cover[valid],
                                     outcome=ev[outcome_col].to_numpy() if task == "spread" else None,
                                     ref_line=ev[rcol].to_numpy() if task == "spread" else None)
@@ -320,6 +326,11 @@ def train_edge_target(task: str, gf: pd.DataFrame, cfg, args) -> dict:
            "model_open_rows": float(np.mean(np.abs(outcome[is_open] - (ref[is_open] + resid_pred[is_open])))) if is_open.any() else np.nan,
            "open_line_open_rows": float(np.mean(np.abs(outcome[is_open] - ref[is_open]))) if is_open.any() else np.nan,
            "close_line_open_rows": float(np.nanmean(np.abs(outcome[is_open] - close[is_open]))) if is_open.any() else np.nan}
+    from scipy.stats import spearmanr
+    scores = {"all_rows": probability_scores(p_cover, cov), "open_rows": probability_scores(p_cover[is_open], cov[is_open]) if is_open.any() else {},
+              "spearman_resid": float(spearmanr(resid_pred, y[valid]).correlation), "spearman_resid_open": float(spearmanr(resid_pred[is_open], y[valid][is_open]).correlation) if is_open.sum() > 10 else np.nan}
+    log.info("[edge_%s] cover-probability log loss %.4f (coin flip %.4f, skill %+.2f%%) | Brier skill %+.2f%% | spearman(resid) %.3f",
+             task, scores["all_rows"]["logloss"], np.log(2), 100 * scores["all_rows"]["logloss_skill"], 100 * scores["all_rows"]["brier_skill"], scores["spearman_resid"])
     report = {"all_rows": roi_table(p_cover, cov, clv),
               "open_rows": roi_table(p_cover[is_open], cov[is_open], clv[is_open]) if is_open.any() else {},
               "close_ref_rows": roi_table(p_cover[~is_open], cov[~is_open], None) if (~is_open).any() else {}}
@@ -347,7 +358,7 @@ def train_edge_target(task: str, gf: pd.DataFrame, cfg, args) -> dict:
 
     with timed(f"[edge_{task}] final fit"):
         fixed = {k: int(np.median([d[k] for d in iters if k in d]) * 1.1) for k in ("cat", "cls") if any(k in d for d in iters)} or None
-        final.fit(X, y, cover, fixed_iters=fixed)
+        final.fit(X, y, cover, fixed_iters=fixed, seasons=seasons_all)
     final.save(out_dir / f"edge_{task}{tag}.joblib")
     oof_out = ev[["game_id", "season", "week", "home_team", "away_team", rcol, close_col, outcome_col, "ref_is_open"]].copy()
     oof_out["resid_pred"] = resid_pred
@@ -359,7 +370,8 @@ def train_edge_target(task: str, gf: pd.DataFrame, cfg, args) -> dict:
     metrics = {"task": task, "n_rows": int(len(e)), "n_open_rows": n_open, "n_oof": int(valid.sum()), "n_oof_open": int(is_open.sum()),
                "features": feats, "weights": final.weights_, "sigma": final.sigma_, "calib": final.calib_, "win_calib": final.win_calib_,
                "fixed_iters": fixed, "mae": mae, "roi": report, "calibration_bins": calib_bins, "by_season": per_season,
-               "win_prob": win_report, "breakeven_110": breakeven(-110.0), "folds": fold_rows}
+               "win_prob": win_report, "breakeven_110": breakeven(-110.0), "folds": fold_rows, "probability_scores": scores,
+               "settings": {"use_cls": use_cls, "recency_halflife": recency, "n_bags": n_bags, "iterations": iterations}}
     metrics["dropped_features"] = sorted(drop)
     with open(out_dir / f"edge_{task}{tag}_metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
@@ -374,6 +386,9 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
     pcfg = cfg.get("models.player", {})
     vcfg = cfg.get("validation", {})
     min_prior = int(cfg.get("features.player_min_prior_games", 1))
+    transform = "none" if kind == "poisson" else str((pcfg.get("transforms") or {}).get(target, DEFAULT_TRANSFORMS.get(target, "none")))
+    if args.player_transform:
+        transform = "none" if kind == "poisson" else args.player_transform
     df = pf[(pf["is_projection"] == 0) & pf["position"].isin(TARGET_POSITIONS[target]) & (pf["career_games"] >= min_prior)
             & pf[target].notna()].reset_index(drop=True)
     feats = [c for c in pman["features"] if c in df.columns]
@@ -391,8 +406,8 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
                                  fold_unit="season", es_tail_frac=float(vcfg.get("early_stop_tail_frac", 0.12)),
                                  max_folds=args.max_folds or args.player_max_folds)
     assert_folds_are_causal(df, folds)
-    log.info("[%s] %s rows (%s), %s features, %s folds (%s .. %s)", target, len(df), "/".join(TARGET_POSITIONS[target]),
-             len(feats), len(folds), folds[0].name, folds[-1].name)
+    log.info("[%s] %s rows (%s), %s features, transform %s, %s folds (%s .. %s)", target, len(df), "/".join(TARGET_POSITIONS[target]),
+             len(feats), transform, len(folds), folds[0].name, folds[-1].name)
 
     if args.smoke:
         cfg.raw.setdefault("feature_selection", {})["null_importance_shuffles"] = 2
@@ -408,49 +423,51 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
         sel_f, _ = _select(df.iloc[f.train_idx], y[f.train_idx], feats, "regression", cfg, seed, always_keep, args)
         fold_features[f.name] = sel_f
         Xf = df[sel_f]
-        model = PlayerModel(target, model_type, nn_params, gbm_params, seed)
+        model = PlayerModel(target, model_type, nn_params, gbm_params, seed, transform=transform)
         model.fit(Xf.iloc[f.fit_idx], y[f.fit_idx], Xf.iloc[f.es_idx], y[f.es_idx])
-        d = model.predict_dist(Xf.iloc[f.val_idx])
-        oof_mu[f.val_idx], oof_sigma[f.val_idx] = d["mu"].to_numpy(), d["sigma"].to_numpy()
-        met = player_metrics(y[f.val_idx], oof_mu[f.val_idx], oof_sigma[f.val_idx], kind)
-        # naive baseline: player's EWM of the target
+        mu_t, sg_t = model.raw_params(Xf.iloc[f.val_idx])
+        oof_mu[f.val_idx], oof_sigma[f.val_idx] = mu_t, sg_t
+        met = player_metrics(y[f.val_idx], mu_t, sg_t, kind, transform)
+        met.pop("td_reliability", None)
         base = df.iloc[f.val_idx][f"{target}_ewm"].fillna(df.iloc[f.val_idx][target].mean()).to_numpy()
         met["baseline_ewm_mae"] = float(np.mean(np.abs(y[f.val_idx] - base)))
         met.update(fold=f.name, n_features=len(sel_f), secs=round(time.time() - t0, 1))
         fold_rows.append(met)
-        log.info("[%s] fold %s: %s", target, f.name, _fmt({k: v for k, v in met.items() if k != "fold"}))
+        log.info("[%s] fold %s: %s", target, f.name, _fmt({k: v for k, v in met.items() if k in ("n", "mae", "medae", "bias", "cover80", "crps", "td_brier", "baseline_ewm_mae", "secs")}))
 
     valid = ~np.isnan(oof_mu)
-    overall = player_metrics(y[valid], oof_mu[valid], oof_sigma[valid], kind)
+    raw = player_metrics(y[valid], oof_mu[valid], oof_sigma[valid], kind, transform)
+    final = PlayerModel(target, model_type, nn_params, gbm_params, seed, transform=transform)
+    final.calibrate(y[valid], oof_mu[valid], oof_sigma[valid])
+    cal_mu, cal_sigma = final.calibrated_params(oof_mu[valid], oof_sigma[valid])
+    overall = player_metrics(y[valid], cal_mu, cal_sigma, kind, transform)
     base = df.loc[valid, f"{target}_ewm"].fillna(df[target].mean()).to_numpy()
     overall["baseline_ewm_mae"] = float(np.mean(np.abs(y[valid] - base)))
     overall["baseline_ewm_bias"] = float(np.mean(base - y[valid]))
     overall["baseline_ewm_rmse"] = float(np.sqrt(np.mean((base - y[valid]) ** 2)))
-    # synthetic prop test: a line set at the recent-average projection rounded to the half; bet the model's side
+    overall["mase"] = float(overall["mae"] / overall["baseline_ewm_mae"]) if overall["baseline_ewm_mae"] > 0 else np.nan
+    # synthetic prop test: line at the recent-average projection rounded to the half; bet the calibrated distribution's side
     line = np.round(base * 2) / 2
-    side = np.sign(oof_mu[valid] - line)
-    res = np.sign(y[valid] - line)
-    live = (side != 0) & (res != 0)
-    overall["synthetic_prop_n"] = int(live.sum())
-    overall["synthetic_prop_hit"] = float(np.mean(side[live] == res[live])) if live.any() else np.nan
-    gap = np.abs(oof_mu[valid] - line)
-    big = live & (gap >= np.nanpercentile(gap[live], 50) if live.any() else False)
-    overall["synthetic_prop_hit_big_gap"] = float(np.mean(side[big] == res[big])) if big.any() else np.nan
-    overall["synthetic_prop_n_big_gap"] = int(big.sum())
-    oof_out = df.loc[valid, ["player_id", "player_name", "position", "team", "opponent", "season", "week", "game_id", "is_home"]].copy()
-    oof_out["actual"] = y[valid]
-    oof_out["mu"] = oof_mu[valid]
-    oof_out["sigma"] = oof_sigma[valid]
-    oof_out["baseline_ewm"] = base
-    oof_out.to_parquet(MODELS_DIR / "player" / f"{target}_oof.parquet", index=False)
-    log.info("[%s] OOF: %s", target, _fmt(overall))
+    if kind == "poisson":
+        line = np.maximum(np.round(base) - 0.5, 0.5)
+    prop = prop_probability_report(y[valid], cal_mu, cal_sigma, line, transform, kind)
+    overall["synthetic_prop_n"] = prop["n"]
+    overall["synthetic_prop_hit"] = prop["hit_rate"]
+    overall["synthetic_prop_hit_conf60"] = prop["hit_rate_conf60"]
+    overall["synthetic_prop_n_conf60"] = prop["n_conf60"]
+    overall["synthetic_prop_logloss_skill"] = prop["logloss_skill"]
+    overall["synthetic_prop_brier_skill"] = prop["brier_skill"]
+    log.info("[%s] OOF (calibrated): %s", target, _fmt({k: overall[k] for k in ("n", "mae", "medae", "bias", "rmse", "baseline_ewm_mae", "mase") if k in overall}))
+    if kind != "poisson":
+        log.info("[%s] coverage 50/80/95 raw %.3f/%.3f/%.3f -> calibrated %.3f/%.3f/%.3f | PIT sd %.3f -> %.3f | CRPS %.3f -> %.3f",
+                 target, raw["cover50"], raw["cover80"], raw["cover95"], overall["cover50"], overall["cover80"], overall["cover95"],
+                 raw["pit_sd"], overall["pit_sd"], raw["crps"], overall["crps"])
+    log.info("[%s] synthetic prop: n=%s hit %.3f (conf>=0.60: %.3f on %s) | P(over) log-loss skill %+.2f%% Brier skill %+.2f%%",
+             target, prop["n"], prop["hit_rate"], prop["hit_rate_conf60"], prop["n_conf60"], 100 * prop["logloss_skill"], 100 * prop["brier_skill"])
 
     with timed(f"[{target}] final selection + fit"):
         selected, report = _select(df, y, feats, "regression", cfg, seed, always_keep, args)
         X = df[selected]
-        final = PlayerModel(target, model_type, nn_params, gbm_params, seed)
-        final.calibrate_sigma(y[valid], oof_mu[valid], oof_sigma[valid])
-        # early-stopping set: random 10% of the most recent three seasons (keeps recency in training)
         rng = np.random.default_rng(seed)
         recent = df["season"] >= df["season"].max() - 2
         es_mask = recent & (rng.random(len(df)) < 0.10)
@@ -459,10 +476,24 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
     final.save(out_dir / f"{target}.joblib")
     if len(report):
         report.to_csv(out_dir / f"{target}_selection.csv")
-    metrics = {"target": target, "kind": kind, "positions": TARGET_POSITIONS[target], "n_rows": int(len(df)),
+    oof_out = df.loc[valid, ["player_id", "player_name", "position", "team", "opponent", "season", "week", "game_id", "is_home"]].copy()
+    oof_out["actual"] = y[valid]
+    oof_out["mu_t_raw"], oof_out["sigma_t_raw"] = oof_mu[valid], oof_sigma[valid]
+    oof_out["mu_t"], oof_out["sigma_t"] = cal_mu, cal_sigma
+    oof_out["mean"] = dist_mean(cal_mu, cal_sigma, transform) if kind != "poisson" else cal_mu
+    oof_out["median"] = dist_quantile(cal_mu, cal_sigma, 0.5, transform) if kind != "poisson" else np.floor(cal_mu)
+    oof_out["q10"] = dist_quantile(cal_mu, cal_sigma, 0.1, transform) if kind != "poisson" else np.nan
+    oof_out["q90"] = dist_quantile(cal_mu, cal_sigma, 0.9, transform) if kind != "poisson" else np.nan
+    oof_out["baseline_ewm"] = base
+    oof_out["synthetic_line"] = line
+    oof_out["p_over_synthetic"] = dist_prob_over(cal_mu, cal_sigma, line, transform, kind)
+    oof_out["transform"] = transform
+    oof_out.to_parquet(out_dir / f"{target}_oof.parquet", index=False)
+    metrics = {"target": target, "kind": kind, "transform": transform, "positions": TARGET_POSITIONS[target], "n_rows": int(len(df)),
                "n_features_selected": len(selected), "features": selected, "model_type": model_type,
                "n_features_by_fold": {k: len(v) for k, v in fold_features.items()}, "fold_features": fold_features,
-               "sigma_scale": final.sigma_scale_, "oof_overall": overall, "folds": fold_rows}
+               "sigma_scale": final.sigma_scale_, "mu_calib": list(final.mu_calib_), "oof_overall": overall, "oof_raw": raw,
+               "synthetic_prop": prop, "folds": fold_rows}
     with open(out_dir / f"{target}_metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
     return metrics
@@ -484,10 +515,13 @@ def main() -> None:
     ap.add_argument("--stage1-min-train-seasons", type=int, default=None, help="stage-1 power models (default 3)")
     ap.add_argument("--edge-min-train-seasons", type=int, default=None, help="stage-2 edge models (default 3)")
     ap.add_argument("--edge-drop", nargs="*", default=None, help="edge models: feature names to exclude (ablation)")
+    ap.add_argument("--edge-no-cls", action="store_true", help="edge models: drop the cover classifier from the calibration")
+    ap.add_argument("--edge-recency-halflife", type=float, default=None, help="edge models: sample-weight halflife in seasons")
     ap.add_argument("--tag", default=None, help="suffix for edge-model artifacts, e.g. --tag noweather (keeps the main models intact)")
     ap.add_argument("--max-folds", type=int, default=None, help="evaluate only the most recent N folds")
     ap.add_argument("--player-max-folds", type=int, default=4, help="player models: most recent N season folds")
     ap.add_argument("--player-model", default=None, choices=[None, "nn", "gbm", "blend"])
+    ap.add_argument("--player-transform", default=None, choices=[None, "none", "log1p", "sqrt"], help="override the target transform for all yardage models")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
     cfg = load_config(args.config)

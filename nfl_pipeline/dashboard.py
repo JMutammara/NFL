@@ -363,9 +363,12 @@ const saveProps = () => { try { localStorage.setItem('nfl-edge-props', JSON.stri
 function priceProp(r){
   const p = (D.players||[]).find(x => (x.player_name||'').toLowerCase() === (r.name||'').toLowerCase());
   if (!p || !isNum(p[r.stat+'_mu'])) return null;
-  const mu = p[r.stat+'_mu'], sig = p[r.stat+'_sigma'];
+  const mu = isNum(p[r.stat+'_median']) ? p[r.stat+'_median'] : p[r.stat+'_mu'], sig = p[r.stat+'_sigma'];
   const line = parseFloat(r.line); if (!isNum(line)) return null;
-  const pOver = r.stat.endsWith('_tds') ? poisAtLeast(mu, Math.ceil(line + 1e-9)) : 1 - ncdf((line - mu)/Math.max(sig, 1e-6));
+  const tr = (D.transforms||{})[r.stat] || 'none';
+  const mu_t = isNum(p[r.stat+'_mu_t']) ? p[r.stat+'_mu_t'] : mu, sig_t = isNum(p[r.stat+'_sigma_t']) ? p[r.stat+'_sigma_t'] : sig;
+  const lt = tr === 'log1p' ? Math.log1p(Math.max(line, 0)) : tr === 'sqrt' ? Math.sqrt(Math.max(line, 0)) : line;
+  const pOver = r.stat.endsWith('_tds') ? poisAtLeast(p[r.stat+'_mu'], Math.ceil(line + 1e-9)) : 1 - ncdf((lt - mu_t)/Math.max(sig_t, 1e-6));
   const oo = isNum(parseFloat(r.over)) ? parseFloat(r.over) : -110, uo = isNum(parseFloat(r.under)) ? parseFloat(r.under) : -110;
   const evO = pOver*payout(oo) - (1-pOver), evU = (1-pOver)*payout(uo) - pOver;
   const side = evO >= evU ? 'OVER' : 'UNDER'; const ps = side === 'OVER' ? pOver : 1-pOver; const o = side === 'OVER' ? oo : uo;
@@ -386,7 +389,7 @@ function renderProps(){
 }
 function renderPropsTable(){
   const t = $('#props-table');
-  t.querySelector('thead').innerHTML = '<tr><th>Player</th><th>Stat</th><th class="num">Line</th><th class="num">Model mean</th><th class="num">Sigma</th><th class="num">P(over)</th><th>Pick</th><th class="num">Price</th><th class="num">Edge</th><th class="num">Stake</th></tr>';
+  t.querySelector('thead').innerHTML = '<tr><th>Player</th><th>Stat</th><th class="num">Line</th><th class="num">Model median</th><th class="num">Spread (±1 sd)</th><th class="num">P(over)</th><th>Pick</th><th class="num">Price</th><th class="num">Edge</th><th class="num">Stake</th></tr>';
   const rows = props.map(r => ({r, x: priceProp(r)}));
   t.querySelector('tbody').innerHTML = rows.length ? rows.map(({r,x}) => x ? `<tr><td><b>${x.player}</b>${r.example ? ' <span class="pill pass">example</span>' : ''} <span style="color:var(--muted)">${x.team}</span></td><td>${(PSTATS.find(s => s[0]===r.stat)||[,r.stat])[1]}</td><td class="num">${f(parseFloat(r.line),1)}</td><td class="num">${f(x.mu,1)}</td><td class="num">${f(x.sig,1)}</td><td class="num">${pct(x.pOver)}</td><td>${x.side} <span class="pill ${x.edge>=5?'strong':x.edge>=state.thr?'lean':'pass'}"><span class="dot"></span>${sg(x.edge,1)}%</span></td><td class="num">${odds(x.o)}</td><td class="num">${sg(x.edge,1)}%</td><td class="num">$${Math.round(x.stake)}</td></tr>`
     : `<tr><td colspan="10" style="color:var(--muted)">${r.name ? `No projection for "${r.name}" on that stat this week.` : 'Enter a player name.'}</td></tr>`).join('') : '<tr><td colspan="10" class="empty">Add a prop above.</td></tr>';

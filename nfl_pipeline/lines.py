@@ -184,7 +184,14 @@ def fetch_lines(schedules: pd.DataFrame, cfg: Config | None = None, refresh: boo
         if c not in lines:
             lines[c] = np.nan
     LINES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lines.to_parquet(LINES_PATH, index=False)
+    # merge into the master table: a weekly slate refresh must never shrink the historical lines
+    if LINES_PATH.exists():
+        master = pd.read_parquet(LINES_PATH)
+        master = master[~master["game_id"].isin(lines["game_id"])]
+        merged = pd.concat([master, lines], ignore_index=True).sort_values(["season", "game_id"]).reset_index(drop=True)
+    else:
+        merged = lines
+    merged.to_parquet(LINES_PATH, index=False)
     cov = lines.groupby("season").agg(games=("game_id", "size"), open_spread=("spread_open", lambda x: x.notna().mean()),
                                       open_total=("total_open", lambda x: x.notna().mean()),
                                       close_spread=("spread_close_espn", lambda x: x.notna().mean()))

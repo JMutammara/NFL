@@ -132,6 +132,8 @@ class EdgeModel:
     iterations: int = 800
     es_rounds: int = 60
     seed: int = 42
+    use_cls: bool = True                 # include the cover classifier as a calibration input
+    recency_halflife: float | None = None  # seasons; sample weight halves every this many seasons back
     features_: list[str] = field(default_factory=list)
     ridge_: Any = None
     cats_: list = field(default_factory=list)
@@ -155,15 +157,23 @@ class EdgeModel:
         return "spread_ref" if self.task == "spread" else "total_ref"
 
     # ------------------------------------------------------------------ fit
+    def _weights(self, seasons: np.ndarray | None, n: int) -> np.ndarray | None:
+        if seasons is None or not self.recency_halflife:
+            return None
+        s = np.asarray(seasons, dtype=float)
+        return 0.5 ** ((s.max() - s) / float(self.recency_halflife))
+
     def fit(self, X: pd.DataFrame, y: np.ndarray, cover: np.ndarray, X_es: pd.DataFrame | None = None,
-            y_es: np.ndarray | None = None, cover_es: np.ndarray | None = None, fixed_iters: dict[str, int] | None = None) -> "EdgeModel":
+            y_es: np.ndarray | None = None, cover_es: np.ndarray | None = None, fixed_iters: dict[str, int] | None = None,
+            seasons: np.ndarray | None = None) -> "EdgeModel":
         from catboost import CatBoostClassifier, CatBoostRegressor
 
         self.features_ = list(X.columns)
         y = np.asarray(y, dtype=float)
         cover = np.asarray(cover, dtype=float)
+        w = self._weights(seasons, len(y))
         self.ridge_ = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), RidgeCV(alphas=np.logspace(0, 4, 25)))
-        self.ridge_.fit(X, y)
+        self.ridge_.fit(X, y, **({"ridgecv__sample_weight": w} if w is not None else {}))
         use_es = X_es is not None and len(X_es) > 0 and not fixed_iters
         self.cats_, self.clss_ = [], []
         reg_iters, cls_iters = [], []
@@ -174,19 +184,26 @@ class EdgeModel:
             it_reg = fixed_iters.get("cat", self.iterations) if fixed_iters else self.iterations
             it_cls = fixed_iters.get("cls", self.iterations) if fixed_iters else self.iterations
             reg = CatBoostRegressor(**_cat_params(seed, it_reg, "reg"), **({"od_type": "Iter", "od_wait": self.es_rounds} if use_es else {}))
-            cls = CatBoostClassifier(**_cat_params(seed, it_cls, "cls"), **({"od_type": "Iter", "od_wait": self.es_rounds} if use_es else {}))
+            wk = {"sample_weight": w} if w is not None else {}
+            wl = {"sample_weight": w[live]} if w is not None else {}
             if use_es:
-                reg.fit(X, y, eval_set=(X_es, y_es), use_best_model=True)
-                cls.fit(X[live], (cover[live] > 0).astype(int), eval_set=(X_es[live_es], (np.asarray(cover_es)[live_es] > 0).astype(int)), use_best_model=True)
+                reg.fit(X, y, eval_set=(X_es, y_es), use_best_model=True, **wk)
                 reg_iters.append(reg.get_best_iteration() + 1)
-                cls_iters.append(cls.get_best_iteration() + 1)
             else:
-                reg.fit(X, y)
-                cls.fit(X[live], (cover[live] > 0).astype(int))
+                reg.fit(X, y, **wk)
             self.cats_.append(reg)
-            self.clss_.append(cls)
+            if self.use_cls:
+                cls = CatBoostClassifier(**_cat_params(seed, it_cls, "cls"), **({"od_type": "Iter", "od_wait": self.es_rounds} if use_es else {}))
+                if use_es:
+                    cls.fit(X[live], (cover[live] > 0).astype(int), eval_set=(X_es[live_es], (np.asarray(cover_es)[live_es] > 0).astype(int)), use_best_model=True, **wl)
+                    cls_iters.append(cls.get_best_iteration() + 1)
+                else:
+                    cls.fit(X[live], (cover[live] > 0).astype(int), **wl)
+                self.clss_.append(cls)
         if reg_iters:
-            self.best_iters_ = {"cat": int(np.median(reg_iters)), "cls": int(np.median(cls_iters))}
+            self.best_iters_ = {"cat": int(np.median(reg_iters))}
+            if cls_iters:
+                self.best_iters_["cls"] = int(np.median(cls_iters))
         return self
 
     # -------------------------------------------------------------- predict
@@ -194,7 +211,7 @@ class EdgeModel:
         X = X[self.features_]
         ridge = self.ridge_.predict(X)
         cat = np.mean([m.predict(X) for m in self.cats_], axis=0)
-        p_cls = np.mean([m.predict_proba(X)[:, 1] for m in self.clss_], axis=0)
+        p_cls = np.mean([m.predict_proba(X)[:, 1] for m in self.clss_], axis=0) if self.clss_ else np.full(len(X), 0.5)
         return pd.DataFrame({"ridge": ridge, "cat": cat, "p_cls": p_cls}, index=X.index)
 
     def blend_resid(self, members: pd.DataFrame) -> np.ndarray:
@@ -243,9 +260,13 @@ class EdgeModel:
         resid_pred = A @ w
         self.sigma_ = float(np.std(y_resid - resid_pred, ddof=1))
         live = np.asarray(cover) != 0
-        Z = np.column_stack([resid_pred[live], logit(np.clip(oof["p_cls"].to_numpy()[live], 1e-6, 1 - 1e-6))])
-        lr = LogisticRegression(C=1.0, max_iter=1000).fit(Z, (np.asarray(cover)[live] > 0).astype(int))
-        self.calib_ = {"a": float(lr.coef_[0][0]), "b": float(lr.coef_[0][1]), "c": float(lr.intercept_[0])}
+        if self.use_cls and self.clss_ or (self.use_cls and "p_cls" in oof and oof["p_cls"].std() > 1e-9):
+            Z = np.column_stack([resid_pred[live], logit(np.clip(oof["p_cls"].to_numpy()[live], 1e-6, 1 - 1e-6))])
+            lr = LogisticRegression(C=1.0, max_iter=1000).fit(Z, (np.asarray(cover)[live] > 0).astype(int))
+            self.calib_ = {"a": float(lr.coef_[0][0]), "b": float(lr.coef_[0][1]), "c": float(lr.intercept_[0])}
+        else:
+            lr = LogisticRegression(C=1.0, max_iter=1000).fit(resid_pred[live].reshape(-1, 1), (np.asarray(cover)[live] > 0).astype(int))
+            self.calib_ = {"a": float(lr.coef_[0][0]), "b": 0.0, "c": float(lr.intercept_[0])}
         if self.task == "spread" and outcome is not None and ref_line is not None:
             mu = np.asarray(ref_line, dtype=float) + resid_pred
             p_norm = np.clip(norm.sf(-mu / self.sigma_), 1e-6, 1 - 1e-6)
@@ -307,6 +328,18 @@ def roi_table(p_cover: np.ndarray, cover: np.ndarray, clv: np.ndarray | None = N
             row["clv_nonneg_rate"] = float(np.mean(c[ok] >= 0)) if ok.any() else np.nan
         out[f"p>={thr:.2f}"] = row
     return out
+
+
+def probability_scores(p_cover: np.ndarray, cover: np.ndarray) -> dict[str, float]:
+    """Proper scoring rules for the calibrated side probability against a coin flip, plus signal strength."""
+    p = np.clip(np.asarray(p_cover, dtype=float), 1e-6, 1 - 1e-6)
+    c = np.asarray(cover, dtype=float)
+    live = c != 0
+    yb = (c[live] > 0).astype(float)
+    pl = p[live]
+    ll = float(-np.mean(yb * np.log(pl) + (1 - yb) * np.log(1 - pl)))
+    return {"n_live": int(live.sum()), "logloss": ll, "logloss_coinflip": float(np.log(2)), "logloss_skill": float(1 - ll / np.log(2)),
+            "brier": float(np.mean((yb - pl) ** 2)), "brier_coinflip": 0.25, "brier_skill": float(1 - np.mean((yb - pl) ** 2) / 0.25)}
 
 
 def breakeven(odds: float = -110.0) -> float:

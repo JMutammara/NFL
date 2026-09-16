@@ -130,6 +130,28 @@ opening number.
 
 `--bet-line open` prices bets at the opening line instead of the current one.
 
+## Evaluation metrics
+
+Everything is out of fold (rolling origin), and every number below is
+written to `data/models/*/<model>_metrics.json` with the per-row predictions
+alongside in `<model>_oof.parquet`.
+
+| aspect | metrics |
+|---|---|
+| game point forecasts | MAE / RMSE of the model against the outcome, next to the same for the opening and closing lines |
+| side picking (spread, total) | flat-stake ROI at -110 by confidence threshold with bootstrap 95% intervals and P(ROI>0); hit rate against break-even (52.4%); closing-line value in points and the share of picks the close moved toward; per-season results; calibration bins (stated vs realised) |
+| cover probabilities | log loss and Brier score against a coin flip (skill %), Spearman correlation of predicted vs actual residual |
+| win probability | log loss and Brier against the vig-free moneyline |
+| player point forecasts | MAE (median forecast), RMSE, median absolute error, bias (mean forecast), error percentiles, share within 10 / 25 units, top-quartile error, MASE against a recent-average baseline |
+| player distributions | coverage of the 50 / 80 / 95% intervals (raw and after calibration), PIT mean and sd, pinball loss at q10 / q50 / q90, CRPS |
+| touchdown probabilities | Brier and log loss of P(>=1) against a constant base rate, reliability by decile, calibration slope, Brier of P(>=2) |
+| prop pricing | synthetic prop test (line at the recent-average projection): hit rate overall and at 60%+ confidence, log-loss and Brier skill of P(over), reliability bins |
+
+Rushing and receiving yards are modelled on a log scale (``models.player.transforms``)
+because they are zero-heavy and right-skewed; the mean is recalibrated and
+the range width is matched to 80% coverage on out-of-fold rows before the
+final model is saved.
+
 ## Tuning
 
 ```bash

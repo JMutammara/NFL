@@ -43,7 +43,7 @@ from nfl_pipeline.models.betting import (expected_value, kelly_fraction, market_
                                          prob_cover_home, prob_over)
 from nfl_pipeline.models.edge_model import EdgeModel, build_edge_frame
 from nfl_pipeline.models.game_ensemble import GameEnsemble
-from nfl_pipeline.models.player_model import TARGET_POSITIONS, PlayerModel, target_kind
+from nfl_pipeline.models.player_model import TARGET_POSITIONS, PlayerModel, dist_prob_over, target_kind
 from nfl_pipeline.utils import american_to_prob, log
 from nfl_pipeline.weather import apply_forecasts, fetch_forecasts
 
@@ -201,15 +201,17 @@ def predict_games(g: pd.DataFrame, models: dict, sched: pd.DataFrame, cfg, bankr
 # ---------------------------------------------------------------------------
 # Players
 # ---------------------------------------------------------------------------
-def predict_players(p: pd.DataFrame, cfg, players_per_team: int) -> pd.DataFrame:
+def predict_players(p: pd.DataFrame, cfg, players_per_team: int) -> tuple[pd.DataFrame, dict]:
+    """Returns (projections, transforms) where transforms maps target -> 'none' | 'log1p' | 'sqrt'."""
     models = {}
     for t in cfg.get("models.player.targets", []):
         path = MODELS_DIR / "player" / f"{t}.joblib"
         if path.exists():
             models[t] = PlayerModel.load(path)
+    transforms = {t: getattr(m, "transform", "none") for t, m in models.items()}
     if not models:
         log.warning("no player models found; skipping player projections")
-        return pd.DataFrame()
+        return pd.DataFrame(), transforms
     active = (p["inj_status"].fillna(0) < 3)
     role = ((p["position"] == "QB") & ((p["depth_rank"] == 1) | (p["snap_pct_ewm"] >= 0.5))) | \
            ((p["position"] != "QB") & ((p["depth_rank"] <= 3) | (p["snap_pct_ewm"] >= 0.25) | (p["target_share_ewm"] >= 0.08)))
@@ -223,24 +225,28 @@ def predict_players(p: pd.DataFrame, cfg, players_per_team: int) -> pd.DataFrame
         mask = u["position"].isin(TARGET_POSITIONS[t])
         if not mask.any():
             continue
-        d = model.predict_dist(u.loc[mask])
-        out.loc[mask, f"{t}_mu"] = d["mu"].to_numpy()
-        out.loc[mask, f"{t}_sigma"] = d["sigma"].to_numpy()
+        rows = u.loc[mask]
+        d = model.predict_dist(rows)
+        out.loc[mask, f"{t}_mu"] = d["mu"].to_numpy()          # mean of the calibrated distribution
+        out.loc[mask, f"{t}_median"] = d["median"].to_numpy()
+        out.loc[mask, f"{t}_sigma"] = d["sigma"].to_numpy()    # ~ one standard deviation on the original scale
+        out.loc[mask, f"{t}_mu_t"] = d["mu_t"].to_numpy()
+        out.loc[mask, f"{t}_sigma_t"] = d["sigma_t"].to_numpy()
         if target_kind(t) == "poisson":
             out.loc[mask, f"{t}_p_any"] = poisson_prob_at_least(d["mu"].to_numpy(), 1)
             out.loc[mask, f"{t}_p_2plus"] = poisson_prob_at_least(d["mu"].to_numpy(), 2)
         else:
-            mu, s = d["mu"].to_numpy(), d["sigma"].to_numpy()
-            out.loc[mask, f"{t}_q10"] = np.maximum(mu - 1.2816 * s, 0)
-            out.loc[mask, f"{t}_q50"] = mu
-            out.loc[mask, f"{t}_q90"] = mu + 1.2816 * s
-    return out.sort_values(["team", "position", "snap_pct_ewm"], ascending=[True, True, False]).reset_index(drop=True)
+            out.loc[mask, f"{t}_q10"] = model.quantile(rows, 0.10)
+            out.loc[mask, f"{t}_q50"] = d["median"].to_numpy()
+            out.loc[mask, f"{t}_q90"] = model.quantile(rows, 0.90)
+    return out.sort_values(["team", "position", "snap_pct_ewm"], ascending=[True, True, False]).reset_index(drop=True), transforms
 
 
-def price_props(props: pd.DataFrame, players: pd.DataFrame, cfg, bankroll: float) -> pd.DataFrame:
+def price_props(props: pd.DataFrame, players: pd.DataFrame, cfg, bankroll: float, transforms: dict | None = None) -> pd.DataFrame:
     """props columns: player_name, stat, line, over_odds, under_odds (odds optional -> -110)."""
     bcfg = cfg.get("betting", {})
     vig = bcfg.get("default_vig_odds", -110)
+    transforms = transforms or {}
     rows = []
     idx = players.set_index(players["player_name"].str.lower())
     for _, r in props.iterrows():
@@ -251,10 +257,10 @@ def price_props(props: pd.DataFrame, players: pd.DataFrame, cfg, bankroll: float
         pr = idx.loc[name]
         pr = pr.iloc[0] if isinstance(pr, pd.DataFrame) else pr
         mu, sig = float(pr[f"{stat}_mu"]), float(pr[f"{stat}_sigma"])
-        if target_kind(stat) == "poisson":
-            p_over = float(poisson_prob_at_least(mu, int(np.ceil(line + 1e-9))))
-        else:
-            p_over = float(prob_over(mu, sig, line))
+        if pd.isna(mu):
+            rows.append({**r.to_dict(), "note": "no projection for this stat"})
+            continue
+        p_over = float(dist_prob_over(float(pr[f"{stat}_mu_t"]), float(pr[f"{stat}_sigma_t"]), line, transforms.get(stat, "none"), target_kind(stat)))
         oo, uo = float(r.get("over_odds", vig) or vig), float(r.get("under_odds", vig) or vig)
         ev_o, ev_u = float(expected_value(p_over, oo)), float(expected_value(1 - p_over, uo))
         side = "OVER" if ev_o >= ev_u else "UNDER"
@@ -279,7 +285,8 @@ def _metrics_payload() -> dict:
     pl = {}
     for p in sorted((MODELS_DIR / "player").glob("*_metrics.json")):
         m = json.load(open(p))
-        pl[m["target"]] = {"oof_overall": m["oof_overall"], "n_features_selected": m["n_features_selected"], "sigma_scale": m.get("sigma_scale")}
+        pl[m["target"]] = {"oof_overall": {k: v for k, v in m["oof_overall"].items() if k != "td_reliability"}, "n_features_selected": m["n_features_selected"],
+                           "sigma_scale": m.get("sigma_scale"), "transform": m.get("transform", "none")}
     out["players"] = pl
     return out
 
@@ -360,8 +367,9 @@ def main() -> None:
 
     players = pd.DataFrame()
     priced = pd.DataFrame()
+    transforms: dict = {}
     if not args.no_players:
-        players = predict_players(p, cfg, args.players_per_team)
+        players, transforms = predict_players(p, cfg, args.players_per_team)
         if len(players):
             players.to_csv(PREDICTIONS_DIR / f"{tag}_players.csv", index=False)
             print(f"\n=== PLAYERS: {len(players)} projections -> {PREDICTIONS_DIR / (tag + '_players.csv')} ===")
@@ -376,7 +384,7 @@ def main() -> None:
                 print(f"\n  top {pos} by {sort}:")
                 print(top[["player_name", "team", "opponent"] + cols].round(2).to_string(index=False))
             if args.props:
-                priced = price_props(pd.read_csv(args.props), players, cfg, args.bankroll)
+                priced = price_props(pd.read_csv(args.props), players, cfg, args.bankroll, transforms)
                 priced.to_csv(PREDICTIONS_DIR / f"{tag}_props.csv", index=False)
                 print("\n=== PRICED PROPS ===")
                 print(priced.round(3).to_string(index=False))
@@ -392,6 +400,7 @@ def main() -> None:
             "games": json.loads(games.to_json(orient="records", date_format="iso")),
             "players": json.loads(players.to_json(orient="records")) if len(players) else [],
             "props": json.loads(priced.to_json(orient="records")) if len(priced) else [],
+            "transforms": transforms,
             "forecasts": json.loads(fc.to_json(orient="records")) if len(fc) else [],
             "metrics": _metrics_payload(),
         }
