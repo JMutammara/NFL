@@ -445,7 +445,9 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
     overall["baseline_ewm_mae"] = float(np.mean(np.abs(y[valid] - base)))
     overall["baseline_ewm_bias"] = float(np.mean(base - y[valid]))
     overall["baseline_ewm_rmse"] = float(np.sqrt(np.mean((base - y[valid]) ** 2)))
+    overall["baseline_ewm_mse"] = float(np.mean((base - y[valid]) ** 2))
     overall["mase"] = float(overall["mae"] / overall["baseline_ewm_mae"]) if overall["baseline_ewm_mae"] > 0 else np.nan
+    overall["mse_skill"] = float(1 - overall["mse"] / overall["baseline_ewm_mse"]) if overall["baseline_ewm_mse"] > 0 else np.nan
     # synthetic prop test: line at the recent-average projection rounded to the half; bet the calibrated distribution's side
     line = np.round(base * 2) / 2
     if kind == "poisson":

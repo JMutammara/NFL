@@ -440,7 +440,8 @@ def player_metrics(y: np.ndarray, mu_t: np.ndarray, sigma_t: np.ndarray, kind: s
     if kind == "poisson":
         rate = np.maximum(mu_t, 1e-6)
         err = rate - y
-        out.update({"mae": float(np.mean(np.abs(err))), "rmse": float(np.sqrt(np.mean(err ** 2))), "medae": float(np.median(np.abs(err))),
+        out.update({"mae": float(np.mean(np.abs(err))), "mse": float(np.mean(err ** 2)), "rmse": float(np.sqrt(np.mean(err ** 2))),
+                    "medae": float(np.median(np.abs(err))),
                     "bias": float(err.mean()), "mean_pred": float(rate.mean()), "mean_actual": float(y.mean()),
                     "err_p05": float(np.percentile(err, 5)), "err_p25": float(np.percentile(err, 25)), "err_p50": float(np.percentile(err, 50)),
                     "err_p75": float(np.percentile(err, 75)), "err_p95": float(np.percentile(err, 95)),
@@ -467,7 +468,8 @@ def player_metrics(y: np.ndarray, mu_t: np.ndarray, sigma_t: np.ndarray, kind: s
     med = dist_quantile(mu_t, s, 0.5, transform)
     mean = dist_mean(mu_t, s, transform)
     err = med - y
-    out.update({"mae": float(np.mean(np.abs(err))), "rmse": float(np.sqrt(np.mean((mean - y) ** 2))), "medae": float(np.median(np.abs(err))),
+    out.update({"mae": float(np.mean(np.abs(err))), "mse": float(np.mean((mean - y) ** 2)), "rmse": float(np.sqrt(np.mean((mean - y) ** 2))),
+                "mse_median": float(np.mean(err ** 2)), "medae": float(np.median(np.abs(err))),
                 "bias": float((mean - y).mean()), "median_bias": float(err.mean()), "mean_pred": float(mean.mean()), "mean_actual": float(y.mean()),
                 "err_p05": float(np.percentile(err, 5)), "err_p25": float(np.percentile(err, 25)), "err_p50": float(np.percentile(err, 50)),
                 "err_p75": float(np.percentile(err, 75)), "err_p95": float(np.percentile(err, 95)),
