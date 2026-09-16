@@ -424,6 +424,25 @@ def train_player_target(target: str, pf: pd.DataFrame, pman: dict, cfg, args) ->
     overall = player_metrics(y[valid], oof_mu[valid], oof_sigma[valid], kind)
     base = df.loc[valid, f"{target}_ewm"].fillna(df[target].mean()).to_numpy()
     overall["baseline_ewm_mae"] = float(np.mean(np.abs(y[valid] - base)))
+    overall["baseline_ewm_bias"] = float(np.mean(base - y[valid]))
+    overall["baseline_ewm_rmse"] = float(np.sqrt(np.mean((base - y[valid]) ** 2)))
+    # synthetic prop test: a line set at the recent-average projection rounded to the half; bet the model's side
+    line = np.round(base * 2) / 2
+    side = np.sign(oof_mu[valid] - line)
+    res = np.sign(y[valid] - line)
+    live = (side != 0) & (res != 0)
+    overall["synthetic_prop_n"] = int(live.sum())
+    overall["synthetic_prop_hit"] = float(np.mean(side[live] == res[live])) if live.any() else np.nan
+    gap = np.abs(oof_mu[valid] - line)
+    big = live & (gap >= np.nanpercentile(gap[live], 50) if live.any() else False)
+    overall["synthetic_prop_hit_big_gap"] = float(np.mean(side[big] == res[big])) if big.any() else np.nan
+    overall["synthetic_prop_n_big_gap"] = int(big.sum())
+    oof_out = df.loc[valid, ["player_id", "player_name", "position", "team", "opponent", "season", "week", "game_id", "is_home"]].copy()
+    oof_out["actual"] = y[valid]
+    oof_out["mu"] = oof_mu[valid]
+    oof_out["sigma"] = oof_sigma[valid]
+    oof_out["baseline_ewm"] = base
+    oof_out.to_parquet(MODELS_DIR / "player" / f"{target}_oof.parquet", index=False)
     log.info("[%s] OOF: %s", target, _fmt(overall))
 
     with timed(f"[{target}] final selection + fit"):

@@ -328,18 +328,60 @@ class PlayerModel:
 
 
 def player_metrics(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray, kind: str) -> dict[str, float]:
+    """Point, distribution and probabilistic accuracy of a player forecast.
+
+    Point:        mae, rmse, medae, bias (mean signed error, + = over-projecting), error percentiles,
+                  share of games within +-10 / +-25 units, and the mean absolute error on the
+                  games that mattered most (top quartile of actual production).
+    Distribution: coverage of the central 50 / 80 / 95% intervals, PIT mean/sd (uniform(0,1)
+                  when the distribution is right), pinball loss at q10/q50/q90 and CRPS.
+    Touchdowns:   Poisson NLL, Brier of P(>=1), its calibration slope, and P(>=1) reliability.
+    """
     from scipy.stats import norm, poisson
 
     y, mu, sigma = (np.asarray(v, dtype=float) for v in (y, mu, sigma))
-    out = {"mae": float(np.mean(np.abs(y - mu))), "rmse": float(np.sqrt(np.mean((y - mu) ** 2))), "n": int(len(y)),
-           "mean_pred": float(mu.mean()), "mean_actual": float(y.mean())}
+    err = mu - y
+    out = {"n": int(len(y)), "mae": float(np.mean(np.abs(err))), "rmse": float(np.sqrt(np.mean(err ** 2))),
+           "medae": float(np.median(np.abs(err))), "bias": float(err.mean()), "mean_pred": float(mu.mean()), "mean_actual": float(y.mean()),
+           "err_p05": float(np.percentile(err, 5)), "err_p25": float(np.percentile(err, 25)), "err_p50": float(np.percentile(err, 50)),
+           "err_p75": float(np.percentile(err, 75)), "err_p95": float(np.percentile(err, 95)),
+           "share_over": float(np.mean(err > 0)), "share_under": float(np.mean(err < 0))}
     if kind == "poisson":
         rate = np.maximum(mu, 1e-6)
         out["poisson_nll"] = float(np.mean(rate - y * np.log(rate)))
         p1 = 1 - poisson.cdf(0, rate)
-        out["td_brier"] = float(np.mean(((y >= 1) - p1) ** 2))
+        hit = (y >= 1).astype(float)
+        out["td_brier"] = float(np.mean((hit - p1) ** 2))
+        out["td_rate_pred"] = float(p1.mean())
+        out["td_rate_actual"] = float(hit.mean())
+        # reliability: actual rate inside deciles of predicted P(>=1)
+        order = np.argsort(p1)
+        bins = np.array_split(order, 10)
+        out["td_reliability"] = [{"pred": float(p1[b].mean()), "actual": float(hit[b].mean()), "n": int(len(b))} for b in bins if len(b)]
+        # calibration slope of actual on predicted probability (1 = perfect)
+        vx = np.var(p1)
+        out["td_calib_slope"] = float(np.cov(p1, hit)[0, 1] / vx) if vx > 0 else np.nan
+        out["p2_brier"] = float(np.mean(((y >= 2).astype(float) - (1 - poisson.cdf(1, rate))) ** 2))
     else:
         s = np.maximum(sigma, 1e-6)
-        out["gauss_nll"] = float(np.mean(0.5 * np.log(2 * np.pi * s ** 2) + (y - mu) ** 2 / (2 * s ** 2)))
-        out["cover80"] = float(np.mean(np.abs(y - mu) <= norm.ppf(0.9) * s))
+        z = (y - mu) / s
+        out["gauss_nll"] = float(np.mean(0.5 * np.log(2 * np.pi * s ** 2) + z ** 2 / 2))
+        for lvl in (50, 80, 95):
+            out[f"cover{lvl}"] = float(np.mean(np.abs(z) <= norm.ppf(0.5 + lvl / 200)))
+        pit = norm.cdf(z)
+        out["pit_mean"], out["pit_sd"] = float(pit.mean()), float(pit.std())
+        for q in (0.1, 0.5, 0.9):
+            qv = mu + norm.ppf(q) * s
+            d = y - qv
+            out[f"pinball_q{int(q * 100)}"] = float(np.mean(np.maximum(q * d, (q - 1) * d)))
+        out["crps"] = float(np.mean(s * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))))
+        scale = 10.0 if y.mean() < 60 else 25.0
+        out["within_10"] = float(np.mean(np.abs(err) <= 10))
+        out["within_25"] = float(np.mean(np.abs(err) <= 25))
+        top = y >= np.percentile(y, 75)
+        out["mae_top_quartile"] = float(np.mean(np.abs(err[top]))) if top.any() else np.nan
+        out["bias_top_quartile"] = float(err[top].mean()) if top.any() else np.nan
+        zero = y == 0
+        out["share_actual_zero"] = float(zero.mean())
+        out["mae_nonzero"] = float(np.mean(np.abs(err[~zero]))) if (~zero).any() else np.nan
     return out
