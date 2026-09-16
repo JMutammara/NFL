@@ -1,19 +1,19 @@
 ```
 ==============================================================================
-FEATURE ENGINEERING SUMMARY  (generated 2026-09-15 10:05)
+FEATURE ENGINEERING SUMMARY  (generated 2026-09-16 11:45)
 ==============================================================================
 
 [GAME-LEVEL MATRIX]  data/features/game_features.parquet
   rows            : 4,101 games  (3,845 played for training, 256 upcoming)
   seasons         : 2012-2026   (postseason included: True)
-  features        : 1,061
+  features        : 1,090
   targets         : home_margin, total_points, home_win, home_cover, over
   market coverage : spread 100.0%, total 100.0%, moneyline 100.0%
   target stats    : margin mean +2.05 sd 14.36 | total mean 45.7 sd 13.9 | home win 55.5%
   market baseline : spread MAE 9.98, total MAE 10.52
   families:
-    team_ewm        360  (avg missing 13.5%)  e.g. home_off_plays_ewm, home_off_dropbacks_ewm, home_off_rushes_ewm, home_off_attempts_ewm ...
-    team_recent     328  (avg missing  6.9%)  e.g. home_off_epa_pp_r3, home_off_epa_pp_r6, home_off_epa_pp_neutral_r3, home_off_epa_pp_neutral_r6 ...
+    team_ewm        364  (avg missing 13.3%)  e.g. home_off_plays_ewm, home_off_dropbacks_ewm, home_off_rushes_ewm, home_off_attempts_ewm ...
+    team_recent     336  (avg missing  6.8%)  e.g. home_off_epa_pp_r3, home_off_epa_pp_r6, home_off_epa_pp_neutral_r3, home_off_epa_pp_neutral_r6 ...
     net_strength     84  (avg missing  0.5%)  e.g. net_epa_pp_r3, net_epa_pp_r6, net_epa_pp_ewm, net_epa_pp_neutral_r3 ...
     matchup         168  (avg missing  0.5%)  e.g. mu_home_epa_pp_r3, mu_away_epa_pp_r3, mu_home_epa_pp_r6, mu_away_epa_pp_r6 ...
     line_matchup     66  (avg missing 16.9%)  e.g. line_home_sack_rate_r3, line_away_sack_rate_r3, line_home_sack_rate_r6, line_away_sack_rate_r6 ...
@@ -21,11 +21,13 @@ FEATURE ENGINEERING SUMMARY  (generated 2026-09-15 10:05)
     experience        5  (avg missing  0.0%)  e.g. home_n_prior_games, away_n_prior_games, home_n_prior_games_season, away_n_prior_games_season ...
     context          33  (avg missing  0.0%)  e.g. week, is_playoff, is_neutral, div_game ...
     market            5  (avg missing  0.0%)  e.g. spread_line, total_line, home_ml_prob_novig, home_implied_pts ...
+    market_ratings   10  (avg missing  1.2%)  e.g. mkt_rt_home, mkt_rt_away, mkt_rt_diff, mkt_hfa ...
+    lines             7  (avg missing 41.6%)  e.g. spread_open, total_open, ml_h_open, ml_a_open ...
   next slate      : season 2026 week 2 -> 16 games
 
 [PLAYER-LEVEL MATRIX]  data/features/player_features.parquet
-  rows            : 89,747 player-games  (81,747 played, 8,000 projection rows)
-  players         : 2,302   by position: WR 34,057, RB 21,688, TE 16,933, QB 9,069
+  rows            : 89,731 player-games  (81,747 played, 7,984 projection rows)
+  players         : 2,301   by position: WR 34,057, RB 21,688, TE 16,933, QB 9,069
   features        : 312
   targets         : passing_yards, passing_tds, rushing_yards, rushing_tds, receiving_yards, receiving_tds  (aux: targets, carries, attempts, receptions)
     passing_yards    mean  23.10  sd  74.11  zero-share 89.3%

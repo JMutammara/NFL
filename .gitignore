@@ -20,3 +20,4 @@ venv/
 # approval marker is a local decision, never committed
 data/features/APPROVED
 predictions/*.html
+reports/*.html
