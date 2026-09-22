@@ -116,7 +116,7 @@ def build_player_features(pg: pd.DataFrame, dvp: pd.DataFrame, tg_rolled: pd.Dat
         pf["inj_practice"] = pf["inj_practice"].fillna(0)
 
     id_cols = ["player_id", "player_name", "position", "team", "opponent", "season", "week", "game_id", "gameday", "is_home",
-               "played", "is_projection"]
+               "played", "is_projection", "inj_carried", "inj_carried_from_week", "inj_prior_status"]
     fam = {
         "usage_roll": [f"{c}_{w}" for c in roll_cols for w in [f"r{x}" for x in windows] + ["ewm"]],
         "volatility": vol_cols + [f"{t}_std_mean" for t in TARGETS],
@@ -125,7 +125,7 @@ def build_player_features(pg: pd.DataFrame, dvp: pd.DataFrame, tg_rolled: pd.Dat
         "opp_def": [f"opp_{c}" for c in ocols] + [f"opp_{c}" for c in dfe],
         "expected_vol": ["exp_targets", "exp_carries", "exp_rec_yards", "exp_rush_yards", "exp_pass_yards", "snap_trend",
                          "target_share_trend", "carry_share_trend"],
-        "status": ["inj_status", "inj_practice", "inj_listed", "depth_rank"],
+        "status": ["inj_status", "inj_practice", "inj_listed", "depth_rank", "inj_report_available"],
         "static": ["pos_QB", "pos_RB", "pos_WR", "pos_TE", "age", "years_exp", "draft_round", "draft_number", "height", "weight"],
         "game": ["is_home", "team_spread", "total_line", "team_implied_pts", "opp_implied_pts", "is_dome", "temp_f", "wind_mph",
                  "team_rest", "is_primetime", "is_playoff", "div_game", "away_travel_mi", "week"],
